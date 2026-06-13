@@ -361,10 +361,24 @@ class Calendar
         foreach ($dbUserEvents as $value) {
             $allDay = filter_var($value['allDay'], FILTER_VALIDATE_BOOLEAN, FILTER_NULL_ON_FAILURE);
 
-            // Filter events by date range if specified
+            // Filter events by date range if specified. Use dtHelper()
+            // rather than CarbonImmutable::parse directly so the
+            // existing isValidDateString() guard catches MySQL zero-date
+            // sentinel (`0000-00-00 00:00:00`), epoch sentinel
+            // (`1969-12-31 00:00:00`), and empty values BEFORE parsing,
+            // and so the parse itself respects Leantime's DB timezone.
+            // Without this, one bad row took down the entire getCalendar
+            // response with a -32000 server error.
             if ($from || $until) {
-                $eventStart = CarbonImmutable::parse($value['dateFrom']);
-                $eventEnd = CarbonImmutable::parse($value['dateTo']);
+                try {
+                    $eventStart = dtHelper()->parseDbDateTime($value['dateFrom'] ?? '');
+                    $eventEnd = dtHelper()->parseDbDateTime($value['dateTo'] ?? '');
+                } catch (\Exception $e) {
+                    // Invalid stored date — skip this event rather than
+                    // killing the feed. SQL audit + cleanup of zero-date
+                    // rows is a separate operations task.
+                    continue;
+                }
 
                 if ($from && $eventEnd < $from) {
                     continue;
@@ -677,30 +691,40 @@ class Calendar
      */
     private function mapEventData(
         string $title,
-        string $description,
+        ?string $description,
         bool $allDay,
-        int $id,
-        int $projectId,
+        ?int $id,
+        ?int $projectId,
         string $eventType,
         string $dateContext,
-        string $backgroundColor,
-        string $borderColor,
-        string $dateFrom,
-        string $dateTo
+        ?string $backgroundColor,
+        ?string $borderColor,
+        ?string $dateFrom,
+        ?string $dateTo
     ): array {
+        // Ticket records in MySQL can legitimately have NULL for any of
+        // the user-facing optional fields here (description, dates, colours)
+        // AND for the foreign-key-style id columns (orphaned tickets, soft-
+        // deleted projects, etc.). PHP 8's strict-type declarations rejected
+        // those with a hard 500. Widening the genuinely-nullable params to
+        // accept null and coercing to safe defaults (empty string / 0)
+        // in the output preserves the payload shape for calendar
+        // consumers — both mobile and web expect strings + numeric ids
+        // — without rewriting every call site or pre-filtering at the
+        // query layer.
         return [
             'title' => $title,
             'allDay' => $allDay,
-            'description' => $description,
-            'dateFrom' => $dateFrom,
-            'dateTo' => $dateTo,
-            'id' => $id,
-            'projectId' => $projectId,
+            'description' => $description ?? '',
+            'dateFrom' => $dateFrom ?? '',
+            'dateTo' => $dateTo ?? '',
+            'id' => $id ?? 0,
+            'projectId' => $projectId ?? 0,
             'eventType' => $eventType,
             'dateContext' => $dateContext,
-            'backgroundColor' => $backgroundColor,
-            'borderColor' => $borderColor,
-            'url' => BASE_URL.'/dashboard/home/#/tickets/showTicket/'.$id,
+            'backgroundColor' => $backgroundColor ?? '',
+            'borderColor' => $borderColor ?? '',
+            'url' => BASE_URL.'/dashboard/home/#/tickets/showTicket/'.($id ?? 0),
         ];
     }
 }
