@@ -10,19 +10,40 @@ use Illuminate\Contracts\Container\BindingResolutionException;
 use Illuminate\Support\Facades\Cache;
 use Illuminate\Support\Facades\Log;
 use Illuminate\Support\Str;
-use Leantime\Core\Configuration\Environment as EnvironmentCore;
+use Leantime\Core\Auth\Permissions\RequiresPermission;
+use Leantime\Core\Domains\BaseService;
 use Leantime\Core\Events\DispatchesEvents;
+use Leantime\Core\Exceptions\AuthorizationException;
+use Leantime\Core\Exceptions\NotFoundException;
+use Leantime\Core\Exceptions\ValidationException;
 use Leantime\Core\Language as LanguageCore;
+use Leantime\Core\Modules\ProjectModules;
 use Leantime\Core\Support\DateTimeHelper;
-use Leantime\Core\Support\FromFormat;
-use Leantime\Core\UI\Template as TemplateCore;
+use Leantime\Domain\Auth\Models\Roles;
+use Leantime\Domain\Auth\Services\Auth;
+use Leantime\Domain\Clients\Services\Clients as ClientService;
+use Leantime\Domain\Comments\Services\Comments as CommentService;
 use Leantime\Domain\Goalcanvas\Services\Goalcanvas;
 use Leantime\Domain\Notifications\Models\Notification as NotificationModel;
-use Leantime\Domain\Projects\Repositories\Projects as ProjectRepository;
 use Leantime\Domain\Projects\Services\Projects as ProjectService;
 use Leantime\Domain\Setting\Repositories\Setting as SettingRepository;
 use Leantime\Domain\Sprints\Services\Sprints as SprintService;
+use Leantime\Domain\Tickets\Events\MilestoneCreated;
+use Leantime\Domain\Tickets\Events\MilestoneDeleted;
+use Leantime\Domain\Tickets\Events\MilestoneUpdated;
+use Leantime\Domain\Tickets\Events\StatusLabelsUpdated;
+use Leantime\Domain\Tickets\Events\SubtasksUpdated;
+use Leantime\Domain\Tickets\Events\TicketAssigned;
+use Leantime\Domain\Tickets\Events\TicketCompleted;
+use Leantime\Domain\Tickets\Events\TicketCreated;
+use Leantime\Domain\Tickets\Events\TicketDeleted;
+use Leantime\Domain\Tickets\Events\TicketListFilter;
+use Leantime\Domain\Tickets\Events\TicketScheduled;
+use Leantime\Domain\Tickets\Events\TicketUpdated;
+use Leantime\Domain\Tickets\Events\TodoWidgetTasksFilter;
+use Leantime\Domain\Tickets\Models\BoardSummary;
 use Leantime\Domain\Tickets\Models\Tickets as TicketModel;
+use Leantime\Domain\Tickets\Permissions\TicketsPermissions;
 use Leantime\Domain\Tickets\Repositories\TicketHistory;
 use Leantime\Domain\Tickets\Repositories\Tickets as TicketRepository;
 use Leantime\Domain\Timesheets\Repositories\Timesheets as TimesheetRepository;
@@ -31,17 +52,40 @@ use Leantime\Domain\Timesheets\Services\Timesheets as TimesheetService;
 /**
  * @api
  */
-class Tickets
+class Tickets extends BaseService
 {
     use DispatchesEvents;
 
     /**
+     * Request-scoped memo for getAllStatusLabelsByUserId(), keyed by "userId|currentProject".
+     *
+     * @var array<string, array>
+     */
+    private array $statusLabelsByUserMemo = [];
+
+    /**
+     * Tickets that already fired TicketCompleted through this service instance, so one request
+     * that writes the same status change twice (e.g. a wrapper calling patch()) reports it once.
+     *
+     * @var array<int, true>
+     */
+    private array $completedTicketIds = [];
+
+    /**
+     * Ticket id => the scheduling window / assignee already reported through this service
+     * instance, so a request that persists the same change twice reports it once.
+     *
+     * @var array<int, string>
+     */
+    private array $reportedSchedules = [];
+
+    /** @var array<int, int> */
+    private array $reportedAssignees = [];
+
+    /**
      * Constructor method for the class.
      *
-     * @param  TemplateCore  $tpl  The template core instance.
      * @param  LanguageCore  $language  The language core instance.
-     * @param  EnvironmentCore  $config  The environment core instance.
-     * @param  ProjectRepository  $projectRepository  The project repository instance.
      * @param  TicketRepository  $ticketRepository  The ticket repository instance.
      * @param  TimesheetRepository  $timesheetsRepo  The timesheet repository instance.
      * @param  SettingRepository  $settingsRepo  The setting repository instance.
@@ -51,12 +95,12 @@ class Tickets
      * @param  TicketHistory  $ticketHistoryRepo  The ticket history repository instance.
      * @param  Goalcanvas  $goalcanvasService  The goal canvas service instance.
      * @param  DateTimeHelper  $dateTimeHelper  The date time helper instance.
+     * @param  CommentService  $commentService  The comments service instance.
+     * @param  ClientService  $clientService  The clients service instance.
+     * @param  ProjectModules  $projectModules  Per-project module switches.
      */
     public function __construct(
-        private TemplateCore $tpl,
         private LanguageCore $language,
-        private EnvironmentCore $config,
-        private ProjectRepository $projectRepository,
         private TicketRepository $ticketRepository,
         private TimesheetRepository $timesheetsRepo,
         private SettingRepository $settingsRepo,
@@ -65,7 +109,10 @@ class Tickets
         private SprintService $sprintService,
         private TicketHistory $ticketHistoryRepo,
         private Goalcanvas $goalcanvasService,
-        private DateTimeHelper $dateTimeHelper
+        private DateTimeHelper $dateTimeHelper,
+        private CommentService $commentService,
+        private ClientService $clientService,
+        private ProjectModules $projectModules,
     ) {}
 
     /**
@@ -76,6 +123,7 @@ class Tickets
      *
      * @api
      */
+    #[RequiresPermission(TicketsPermissions::VIEW, projectIdParam: 'projectId')]
     public function getStatusLabels($projectId = null): array
     {
         return $this->ticketRepository->getStateLabels($projectId);
@@ -89,8 +137,16 @@ class Tickets
      *
      * @api
      */
+    #[RequiresPermission(TicketsPermissions::VIEW)]
     public function getAllStatusLabelsByUserId($userId): array
     {
+        // Request-scoped memo: this is called repeatedly within a single dashboard
+        // load (e.g. twice inside getToDoWidgetHierarchicalAssignments, plus the
+        // weekly/sprint queries) and the result is stable for the request.
+        $memoKey = $userId.'|'.(session()->exists('currentProject') ? session('currentProject') : '');
+        if (isset($this->statusLabelsByUserMemo[$memoKey])) {
+            return $this->statusLabelsByUserMemo[$memoKey];
+        }
 
         $statusLabelsByProject = [];
 
@@ -107,8 +163,9 @@ class Tickets
         }
 
         // There is a non zero chance that a user has tickets assigned to them without a project assignment.
-        // Checking user assigned tickets to see if there are missing projects.
-        $allTickets = $this->ticketRepository->getAllBySearchCriteria(['currentProject' => '', 'users' => $userId, 'status' => 'not_done', 'sprint' => ''], 'duedate');
+        // Checking user assigned tickets to see if there are missing projects. We only need the
+        // distinct project ids here, so skip the (expensive) comment/file/subtask count subqueries.
+        $allTickets = $this->ticketRepository->getAllBySearchCriteria(['currentProject' => '', 'users' => $userId, 'status' => 'not_done', 'sprint' => ''], 'duedate', null, false);
 
         foreach ($allTickets as $row) {
             if (! isset($statusLabelsByProject[$row['projectId']])) {
@@ -116,7 +173,7 @@ class Tickets
             }
         }
 
-        return $statusLabelsByProject;
+        return $this->statusLabelsByUserMemo[$memoKey] = $statusLabelsByProject;
     }
 
     /**
@@ -125,8 +182,8 @@ class Tickets
      * @params array $params label information
      *
      * @api
-     * @api
      */
+    #[RequiresPermission(TicketsPermissions::EDIT)]
     public function saveStatusLabels($params): bool
     {
         if (isset($params['labelKeys']) && is_array($params['labelKeys']) && count($params['labelKeys']) > 0) {
@@ -135,16 +192,25 @@ class Tickets
             foreach ($params['labelKeys'] as $labelKey) {
                 $labelKey = filter_var($labelKey, FILTER_SANITIZE_NUMBER_INT);
 
+                // The class is rendered into class attributes; only accept a plain label-* css class.
+                $labelClass = (string) ($params['labelClass-'.$labelKey] ?? '');
+                if (! TicketRepository::isValidLabelClass($labelClass)) {
+                    $labelClass = 'label-default';
+                }
+
                 $statusArray[$labelKey] = [
                     'name' => $params['label-'.$labelKey] ?? '',
-                    'class' => $params['labelClass-'.$labelKey] ?? 'label-default',
+                    'class' => $labelClass,
                     'statusType' => $params['labelType-'.$labelKey] ?? 'NEW',
                     'kanbanCol' => $params['labelKanbanCol-'.$labelKey] ?? false,
                     'sortKey' => $params['labelSort-'.$labelKey] ?? 99,
                 ];
             }
 
-            self::dispatchEvent('statusLabels_updated');
+            StatusLabelsUpdated::dispatch(
+                projectId: session('currentProject') ? (int) session('currentProject') : null,
+                legacyHook: __FUNCTION__
+            );
 
             Cache::forget('projectsettings.'.session('currentProject').'.ticketlabels');
 
@@ -157,6 +223,7 @@ class Tickets
     /**
      * @api
      */
+    #[RequiresPermission(TicketsPermissions::VIEW)]
     public function getKanbanColumns(): array
     {
 
@@ -178,6 +245,7 @@ class Tickets
      *
      * @api
      */
+    #[RequiresPermission(TicketsPermissions::VIEW)]
     public function getTypeIcons(): array
     {
 
@@ -189,6 +257,7 @@ class Tickets
      *
      * @api
      */
+    #[RequiresPermission(TicketsPermissions::VIEW)]
     public function getEffortLabels(): array
     {
 
@@ -200,6 +269,7 @@ class Tickets
      *
      * @api
      */
+    #[RequiresPermission(TicketsPermissions::VIEW)]
     public function getTicketTypes(): array
     {
 
@@ -211,6 +281,7 @@ class Tickets
      *
      * @api
      */
+    #[RequiresPermission(TicketsPermissions::VIEW)]
     public function getPriorityLabels(): array
     {
 
@@ -240,6 +311,7 @@ class Tickets
             'sprint' => session('currentSprint') ?? '',
             'users' => '',
             'clients' => '',
+            'projects' => '',
             'status' => '',
             'term' => '',
             'effort' => '',
@@ -257,9 +329,8 @@ class Tickets
             $searchCriteria['currentProject'] = $searchParams['currentProject'];
         }
 
-        if (isset($searchParams['currentUser']) === true) {
-            $searchCriteria['currentUser'] = $searchParams['currentUser'];
-        }
+        // currentUser/currentClient are deliberately NOT taken from $searchParams: they define the
+        // project-membership scope of the query and must always be the session user/client.
 
         if (isset($searchParams['users']) === true) {
             $searchCriteria['users'] = $searchParams['users'];
@@ -316,6 +387,13 @@ class Tickets
             $searchCriteria['clients'] = $searchParams['clients'];
         }
 
+        // Multi-project filter (comma separated project ids). Used by program-level
+        // cross-project task views. When set it takes precedence over the single
+        // currentProject filter in the repository (see getAllBySearchCriteria).
+        if (isset($searchParams['projects']) === true) {
+            $searchCriteria['projects'] = $searchParams['projects'];
+        }
+
         // The sprint selector is just a filter but remains in place across the session. Setting session here when it's selected
         if (isset($searchParams['sprint']) === true) {
             $searchCriteria['sprint'] = $searchParams['sprint'];
@@ -328,6 +406,7 @@ class Tickets
     /**
      * @api
      */
+    #[RequiresPermission(TicketsPermissions::VIEW)]
     public function countSetFilters(array $searchCriteria): int
     {
         $count = 0;
@@ -355,6 +434,7 @@ class Tickets
     /**
      * @api
      */
+    #[RequiresPermission(TicketsPermissions::VIEW)]
     public function getSetFilters(array $searchCriteria, bool $includeGroup = false): array
     {
         $setFilters = [];
@@ -381,17 +461,30 @@ class Tickets
     /**
      * Retrieves all tickets based on the provided search criteria.
      *
-     * @param  array|null  $searchParams  An associative array containing search parameters such as
-     *                                    'currentProject', 'currentUser', 'users', 'status', 'term',
-     *                                    'effort', 'excludeType', 'type', 'milestone', 'groupBy',
-     *                                    'orderBy', 'orderDirection', 'priority', 'clients', and 'sprint'.
-     *                                    These values are used to filter the search results.
+     * @param  array|null  $searchCriteria  An associative array containing search parameters such as
+     *                                      'currentProject', 'currentUser', 'users', 'status', 'term',
+     *                                      'effort', 'excludeType', 'type', 'milestone', 'groupBy',
+     *                                      'orderBy', 'orderDirection', 'priority', 'clients', and 'sprint'.
+     *                                      These values are used to filter the search results.
+     *                                      Server-side filters for API watchers (#3700), all optional and
+     *                                      usable without a project (results stay limited to projects
+     *                                      the caller can access):
+     *                                      - 'modifiedAfter' / 'modifiedBefore': ISO 8601 datetime; matches
+     *                                      the ticket's last modification (creation date if never modified).
+     *                                      - 'statusType': comma list of NEW, INPROGRESS, DONE, NOT_DONE,
+     *                                      resolved against each ticket's own project status labels.
      * @return array|false An array of tickets matching the search criteria, or false on failure.
+     *
+     * @throws ValidationException When modifiedAfter/modifiedBefore is not a date or statusType is unknown.
      *
      * @api
      */
+    #[RequiresPermission(TicketsPermissions::VIEW)]
     public function getAll(?array $searchCriteria = null, ?int $limit = null): array|false
     {
+        if ($searchCriteria !== null) {
+            $searchCriteria = $this->normalizeApiTicketFilters($searchCriteria);
+        }
 
         if (isset($searchCriteria['dateFrom'])) {
             try {
@@ -423,26 +516,169 @@ class Tickets
         return $tickets;
     }
 
+    /**
+     * Compact ticket discovery for API/agent watchers (#3703).
+     *
+     * Returns status counts for every ticket in scope plus a slim list of the "active" tickets
+     * (by default everything in an INPROGRESS-type status), so a watcher does not have to pull and
+     * filter the full getAll() payload. Only projects the caller can access are counted.
+     *
+     * @param  int|null  $projectId  Limit to one project (null = every accessible, non-closed project).
+     * @param  string|null  $statusType  Which tickets to list as active: NEW, INPROGRESS, DONE, NOT_DONE (comma list). Default INPROGRESS.
+     * @param  string|null  $modifiedAfter  ISO 8601 datetime; only count/list tickets changed since then.
+     * @param  bool  $includeSubtasks  Include subtasks (default true). Milestones are never included.
+     * @param  int  $activeLimit  Maximum active tickets returned, most recently modified first (1-500, default 50).
+     * @return array{total: int, countsByType: array<string, int>, countsByStatus: array<int, array<string, mixed>>, active: array<int, array<string, mixed>>, activeTotal: int, activeTruncated: bool}
+     *
+     * @throws ValidationException When a filter value is invalid.
+     * @throws \Leantime\Core\Exceptions\AuthorizationException When the caller may not view the project.
+     *
+     * @api
+     */
+    #[RequiresPermission(TicketsPermissions::VIEW, projectIdParam: 'projectId')]
+    public function getStatusSummary(?int $projectId = null, ?string $statusType = 'INPROGRESS', ?string $modifiedAfter = null, bool $includeSubtasks = true, int $activeLimit = 50): array
+    {
+        // MCP tools call services directly, so authorize in-body as well.
+        if ($projectId !== null && $projectId > 0) {
+            $this->authorize(TicketsPermissions::VIEW, $projectId);
+        }
+
+        $filters = $this->normalizeApiTicketFilters([
+            'modifiedAfter' => $modifiedAfter ?? '',
+            'statusType' => ($statusType === null || $statusType === '') ? 'INPROGRESS' : $statusType,
+        ]);
+        $activeLimit = max(1, min(500, $activeLimit));
+
+        $scopedProjectId = ($projectId !== null && $projectId > 0) ? $projectId : null;
+
+        // Both queries run in the database: grouped counts, and a separately ordered + limited
+        // slim list, so cost does not grow with every ticket in scope.
+        $statusCounts = $this->ticketRepository->countTicketsByProjectAndStatus($scopedProjectId, $filters['modifiedAfter'], $includeSubtasks);
+        $activeTickets = $this->ticketRepository->getActiveTicketSummaries($scopedProjectId, $filters['modifiedAfter'], $includeSubtasks, $filters['statusType'], $activeLimit);
+
+        $countsByType = ['NEW' => 0, 'INPROGRESS' => 0, 'DONE' => 0];
+        $countsByStatus = [];
+        $labelsByProject = [];
+        $total = 0;
+
+        $statusTypeOf = function (int $ticketProjectId, int $status) use (&$labelsByProject): array {
+            $labelsByProject[$ticketProjectId] ??= $this->ticketRepository->getStateLabels($ticketProjectId);
+            $label = $labelsByProject[$ticketProjectId][$status] ?? null;
+
+            return [strtoupper((string) ($label['statusType'] ?? 'NONE')), $label];
+        };
+
+        foreach ($statusCounts as $statusCount) {
+            [$statusTypeName, $label] = $statusTypeOf($statusCount['projectId'], $statusCount['status']);
+
+            $total += $statusCount['count'];
+            $countsByType[$statusTypeName] = ($countsByType[$statusTypeName] ?? 0) + $statusCount['count'];
+            $countsByStatus[] = [
+                'projectId' => $statusCount['projectId'],
+                'status' => $statusCount['status'],
+                'statusType' => $statusTypeName,
+                'label' => $label !== null ? $this->language->__((string) ($label['name'] ?? '')) : '',
+                'count' => $statusCount['count'],
+            ];
+        }
+
+        $active = [];
+        foreach ($activeTickets['rows'] as $ticket) {
+            $ticketProjectId = (int) $ticket['projectId'];
+            [$statusTypeName] = $statusTypeOf($ticketProjectId, (int) $ticket['status']);
+
+            $active[] = [
+                'id' => (int) $ticket['id'],
+                'headline' => $ticket['headline'],
+                'type' => ($ticket['type'] ?? '') !== '' ? $ticket['type'] : 'task',
+                'projectId' => $ticketProjectId,
+                'projectName' => $ticket['projectName'] ?? '',
+                'status' => (int) $ticket['status'],
+                'statusType' => $statusTypeName,
+                'editorId' => $ticket['editorId'] !== null && $ticket['editorId'] !== '' ? (int) $ticket['editorId'] : null,
+                'dependingTicketId' => (int) ($ticket['dependingTicketId'] ?? 0) > 0 ? (int) $ticket['dependingTicketId'] : null,
+                'milestoneid' => (int) ($ticket['milestoneid'] ?? 0) > 0 ? (int) $ticket['milestoneid'] : null,
+                'dateToFinish' => $ticket['dateToFinish'] ?? null,
+                'modified' => $ticket['lastModified'] ?? null,
+                'commentCount' => (int) ($ticket['commentCount'] ?? 0),
+            ];
+        }
+
+        return [
+            'total' => $total,
+            'countsByType' => $countsByType,
+            'countsByStatus' => $countsByStatus,
+            'active' => $active,
+            'activeTotal' => $activeTickets['total'],
+            'activeTruncated' => $activeTickets['total'] > count($active),
+        ];
+    }
+
+    /**
+     * Validate and normalize the API watcher filters of a ticket search (#3700).
+     *
+     * modifiedAfter/modifiedBefore are parsed (ISO 8601, or the user's date format) and converted
+     * to UTC database datetimes; statusType is upper-cased and checked against the known types.
+     *
+     * @param  array<string, mixed>  $searchCriteria  The raw search criteria.
+     * @return array<string, mixed> The criteria with normalized filter values.
+     *
+     * @throws ValidationException When a filter value is invalid.
+     */
+    private function normalizeApiTicketFilters(array $searchCriteria): array
+    {
+        foreach (['modifiedAfter', 'modifiedBefore'] as $dateFilter) {
+            if (! isset($searchCriteria[$dateFilter]) || $searchCriteria[$dateFilter] === '') {
+                continue;
+            }
+
+            try {
+                $searchCriteria[$dateFilter] = dtHelper()->parseUserDateTime((string) $searchCriteria[$dateFilter])->formatDateTimeForDb();
+            } catch (\Throwable $e) {
+                $message = "{$dateFilter} must be an ISO 8601 datetime (e.g. 2026-07-27T00:00:00Z).";
+
+                throw new ValidationException([$dateFilter => [$message]], $message);
+            }
+        }
+
+        if (isset($searchCriteria['statusType']) && $searchCriteria['statusType'] !== '') {
+            $allowedTypes = ['NEW' => 'NEW', 'INPROGRESS' => 'INPROGRESS', 'DONE' => 'DONE', 'NOTDONE' => 'NOT_DONE'];
+            $statusTypes = [];
+            foreach (explode(',', (string) $searchCriteria['statusType']) as $statusType) {
+                $compactType = strtoupper(str_replace([' ', '_', '-'], '', trim($statusType)));
+
+                if (! isset($allowedTypes[$compactType])) {
+                    $message = 'statusType must be a comma separated list of: NEW, INPROGRESS, DONE, NOT_DONE.';
+
+                    throw new ValidationException(['statusType' => [$message]], $message);
+                }
+
+                $statusTypes[] = $allowedTypes[$compactType];
+            }
+
+            $searchCriteria['statusType'] = implode(',', array_unique($statusTypes));
+        }
+
+        return $searchCriteria;
+    }
+
     private function decorateWithFriendlyStatusLabels(array $tickets): array
     {
 
-        if (is_array($tickets)) {
+        $ticketCounter = 0;
+        $projectStatusLabels = [];
 
-            $ticketCounter = 0;
-            $projectStatusLabels = [];
+        foreach ($tickets as &$ticket) {
 
-            foreach ($tickets as &$ticket) {
-
-                if (! isset($projectStatusLabels[$ticket['projectId']])) {
-                    $projectStatusLabels[$ticket['projectId']] = $this->ticketRepository->getStateLabels($ticket['projectId']);
-                }
-
-                if (isset($projectStatusLabels[$ticket['projectId']][$ticket['status']]) &&
-                    $projectStatusLabels[$ticket['projectId']][$ticket['status']]['statusType'] !== 'DONE') {
-                    $ticket['statusLabel'] = $projectStatusLabels[$ticket['projectId']][$ticket['status']]['name'];
-                }
-
+            if (! isset($projectStatusLabels[$ticket['projectId']])) {
+                $projectStatusLabels[$ticket['projectId']] = $this->ticketRepository->getStateLabels($ticket['projectId']);
             }
+
+            if (isset($projectStatusLabels[$ticket['projectId']][$ticket['status']]) &&
+                $projectStatusLabels[$ticket['projectId']][$ticket['status']]['statusType'] !== 'DONE') {
+                $ticket['statusLabel'] = $projectStatusLabels[$ticket['projectId']][$ticket['status']]['name'];
+            }
+
         }
 
         return $tickets;
@@ -500,10 +736,14 @@ class Tickets
      *
      * @api
      */
+    #[RequiresPermission(TicketsPermissions::VIEW)]
     public function getAllOpenUserTickets(?int $userId = null, ?int $project = null): array
     {
 
-        $tickets = $this->ticketRepository->simpleTicketQuery($userId, $project);
+        // Exclude closed projects (state === -1) at the SQL level — "My open
+        // tickets" shouldn't surface work from projects that are no longer
+        // active (they were padding the mobile task list).
+        $tickets = $this->ticketRepository->simpleTicketQuery($userId, $project, excludeClosedProjects: true);
 
         $ticketArray = [];
 
@@ -520,7 +760,17 @@ class Tickets
 
                     if (isset($projectStatusLabels[$ticket['projectId']][$ticket['status']]) &&
                         $projectStatusLabels[$ticket['projectId']][$ticket['status']]['statusType'] !== 'DONE') {
-                        $ticket['statusLabel'] = $projectStatusLabels[$ticket['projectId']][$ticket['status']]['name'];
+                        // Ship the resolved status label, class, and type
+                        // so mobile (which doesn't preload each project's
+                        // status config) can render the correct label
+                        // and colour without an extra round trip per
+                        // project. Web doesn't need these because it
+                        // already has the project config loaded
+                        // server-side at render time.
+                        $statusConfig = $projectStatusLabels[$ticket['projectId']][$ticket['status']];
+                        $ticket['statusLabel'] = $statusConfig['name'];
+                        $ticket['statusClass'] = $statusConfig['class'] ?? '';
+                        $ticket['statusType'] = $statusConfig['statusType'] ?? '';
                         $ticketArray[] = $ticket;
                     }
                 }
@@ -542,8 +792,12 @@ class Tickets
      *
      * @api
      */
+    #[RequiresPermission(TicketsPermissions::VIEW)]
     public function getScheduledTasks(CarbonImmutable|string $dateFrom, CarbonImmutable|string $dateTo, ?int $userId)
     {
+        // Reachable over JSON-RPC: only the authenticated user's own schedule. Every in-app caller
+        // already passes the session user; a caller-supplied id would expose another user's tasks.
+        $userId = (int) session('userdata.id');
 
         if (is_string($dateFrom) && dtHelper()->isValidDateString($dateFrom)) {
             $dateFrom = dtHelper()->parseUserDateTime($dateFrom);
@@ -581,6 +835,7 @@ class Tickets
      *
      * @api
      */
+    #[RequiresPermission(TicketsPermissions::VIEW)]
     public function getAllGrouped($searchCriteria): array
     {
         $ticketGroups = [];
@@ -632,12 +887,16 @@ class Tickets
                 if (isset($ticketGroups[$groupedFieldValue])) {
                     $ticketGroups[$groupedFieldValue]['items'][] = $ticket;
                 } else {
+                    // 'label' is rendered RAW by every consumer (kanban swimlane header,
+                    // table/list accordion headers) because some groups embed markup — a type
+                    // icon, the assignee avatar. So this switch is the escaping boundary:
+                    // every branch must htmlspecialchars any user-controlled text it embeds.
                     switch ($searchCriteria['groupBy']) {
                         case 'status':
                             $status = $this->getStatusLabels();
 
                             if (isset($status[$groupedFieldValue])) {
-                                $label = $status[$groupedFieldValue]['name'];
+                                $label = htmlspecialchars((string) $status[$groupedFieldValue]['name'], ENT_QUOTES, 'UTF-8');
                                 $class = $status[$groupedFieldValue]['class'];
                             } else {
                                 $label = 'New';
@@ -668,8 +927,11 @@ class Tickets
                         case 'milestoneid':
                             $label = 'No Milestone Set';
                             $sortId = 'zzz_no_milestone'; // Sort "No Milestone" last alphabetically
-                            if ($ticket['milestoneid'] > 0) {
-                                $milestone = $this->getTicket($ticket['milestoneid']);
+                            // getTicket() returns false when the current user can't access the
+                            // milestone's project (e.g. a cross-project milestone linked to a goal).
+                            // Fall back to the "No Milestone Set" default rather than dereferencing false.
+                            $milestone = $ticket['milestoneid'] > 0 ? $this->getTicket($ticket['milestoneid']) : false;
+                            if ($milestone) {
                                 $color = $milestone->tags;
                                 $class = '';
                                 $groupColor = $color;
@@ -687,15 +949,16 @@ class Tickets
                                 }
 
                                 $statusLabels = $this->getStatusLabels($milestone->projectId);
-                                $status = $statusLabels[$milestone->status]['name'];
+                                $status = htmlspecialchars((string) ($statusLabels[$milestone->status]['name'] ?? ''), ENT_QUOTES, 'UTF-8');
                                 $moreInfo = $this->language->__('label.start').': '.$startDate.' • '.$this->language->__('label.end').': '.$endDate.' • '.$this->language->__('label.status_lowercase').': '.$status;
-                                $label = $ticket['milestoneHeadline'];
+                                $label = htmlspecialchars((string) $ticket['milestoneHeadline'], ENT_QUOTES, 'UTF-8');
                                 $sortId = 'a_'.preg_replace('/[^a-zA-Z0-9_-]/', '_', $ticket['milestoneHeadline']); // Named milestones sort first alphabetically
                             }
 
                             break;
                         case 'editorId':
-                            $label = "<div class='profileImage'><img src='".BASE_URL.'/api/users?profileImage='.$ticket['editorId']."' /></div> ".$ticket['editorFirstname'].' '.$ticket['editorLastname'];
+                            $editorName = htmlspecialchars(trim($ticket['editorFirstname'].' '.$ticket['editorLastname']), ENT_QUOTES, 'UTF-8');
+                            $label = "<div class='profileImage'><img alt='' src='".BASE_URL.'/api/users?profileImage='.(int) $ticket['editorId']."' /></div> ".$editorName;
 
                             if ($ticket['editorFirstname'] == '' && $ticket['editorLastname'] == '') {
                                 $label = 'Not Assigned to Anyone';
@@ -703,26 +966,37 @@ class Tickets
 
                             break;
                         case 'sprint':
-                            $label = $ticket['sprintName'];
+                            // Rendered raw ({!! !!}) in the kanban swimlane header, so escape the
+                            // user-controlled sprint name to prevent stored XSS.
+                            $label = htmlspecialchars((string) $ticket['sprintName'], ENT_QUOTES, 'UTF-8');
                             if ($label == '') {
                                 $label = 'Not assigned to a sprint';
                             }
                             break;
                         case 'type':
                             $icon = $this->getTypeIcons();
-                            $label = "<i class='fa ".($icon[strtolower($ticket['type'])] ?? '')."'></i>".$ticket['type'];
+                            $label = "<i class='fa ".($icon[strtolower($ticket['type'])] ?? '')."'></i>".htmlspecialchars((string) $ticket['type'], ENT_QUOTES, 'UTF-8');
                             break;
                         case 'dependingTicketId':
                             if ($ticket['dependingTicketId'] > 0 && ! empty($ticket['parentHeadline'])) {
-                                $label = $ticket['parentHeadline'];
-                                $sortId = 'a_'.strtolower($ticket['parentHeadline']);
+                                // Rendered raw in the swimlane header — escape the user headline.
+                                $label = htmlspecialchars((string) $ticket['parentHeadline'], ENT_QUOTES, 'UTF-8');
+                                $sortId = 'a_'.preg_replace('/[^a-zA-Z0-9_-]/', '_', strtolower((string) $ticket['parentHeadline']));
                             } else {
                                 $label = $this->language->__('label.no_parent_task');
                                 $sortId = 'zzz_no_parent';
                             }
                             break;
+                        case 'projectId':
+                            // Program cross-project board: group by the ticket's project.
+                            $label = htmlspecialchars((string) ($ticket['projectName'] ?? ('Project #'.$groupedFieldValue)), ENT_QUOTES, 'UTF-8');
+                            // Becomes $group['id'], which templates interpolate into inline
+                            // onclick JS string literals — sanitize like the milestone and
+                            // parent-task branches already do.
+                            $sortId = 'a_'.preg_replace('/[^a-zA-Z0-9_-]/', '_', strtolower((string) ($ticket['projectName'] ?? $groupedFieldValue)));
+                            break;
                         default:
-                            $label = $groupedFieldValue;
+                            $label = htmlspecialchars((string) $groupedFieldValue, ENT_QUOTES, 'UTF-8');
                             break;
                     }
 
@@ -886,7 +1160,7 @@ class Tickets
         }
 
         // Get today's date at midnight in user's timezone
-        $today = CarbonImmutable::now()->startOfDay();
+        $today = dtHelper()->userNow()->startOfDay();
 
         // Assign each ticket to appropriate bucket
         foreach ($tickets as $ticket) {
@@ -935,7 +1209,8 @@ class Tickets
         }
 
         try {
-            $dueDate = CarbonImmutable::parse($dateToFinish)->startOfDay();
+            // Stored in UTC (a user's end-of-day); compare on the user's calendar day.
+            $dueDate = CarbonImmutable::parse($dateToFinish, 'UTC')->setTimezone($today->getTimezone())->startOfDay();
         } catch (\Exception $e) {
             return 'no-due-date';
         }
@@ -977,7 +1252,8 @@ class Tickets
      *
      * @api
      */
-    public function getStatusBreakdownBySwimlane(array $groupedTickets, array $statusColumns): array
+    #[RequiresPermission(TicketsPermissions::VIEW)]
+    public function getStatusBreakdownBySwimlane(array $groupedTickets, array $statusColumns, string $statusField = 'status'): array
     {
         $breakdown = [];
 
@@ -997,7 +1273,9 @@ class Tickets
             $now = CarbonImmutable::now();
 
             foreach ($group['items'] as $ticket) {
-                $status = (string) ($ticket['status'] ?? '');
+                // $statusField is 'statusType' on the program (cross-project) kanban, where
+                // columns are semantic status types rather than per-project status keys.
+                $status = (string) ($ticket[$statusField] ?? '');
                 if (isset($statusCounts[$status])) {
                     $statusCounts[$status]++;
                     $totalCount++;
@@ -1049,16 +1327,33 @@ class Tickets
     }
 
     /**
+     * Tickets of a project that may serve as the parent of $ticket.
+     *
+     * The project defaults to the session project. Whatever it resolves to, the caller must hold
+     * tickets.view in THAT project; an unresolvable/non-positive project or a denied one yields
+     * an empty list (never the unscoped all-projects query).
+     *
+     * @param  TicketModel  $ticket  The ticket whose possible parents are listed.
+     * @param  string  $projectId  Project id, or 'currentProject' for the session project.
+     * @return array<int, TicketModel>
+     *
      * @api
      */
+    #[RequiresPermission(TicketsPermissions::VIEW)]
     public function getAllPossibleParents(TicketModel $ticket, string $projectId = 'currentProject'): array
     {
+        $rawProjectId = $projectId === 'currentProject' ? session('currentProject') : $projectId;
 
-        if ($projectId == 'currentProject') {
-            $projectId = session('currentProject');
+        $resolvedProjectId = filter_var($rawProjectId, FILTER_VALIDATE_INT);
+        if ($resolvedProjectId === false || $resolvedProjectId <= 0) {
+            return [];
         }
 
-        $results = $this->ticketRepository->getAllPossibleParents($ticket, $projectId);
+        if (! $this->can(TicketsPermissions::VIEW, $resolvedProjectId)) {
+            return [];
+        }
+
+        $results = $this->ticketRepository->getAllPossibleParents($ticket, $resolvedProjectId);
 
         if (is_array($results)) {
             return $results;
@@ -1075,6 +1370,7 @@ class Tickets
      *
      * @api
      */
+    #[RequiresPermission(TicketsPermissions::VIEW)]
     public function getTicket($id): TicketModel|bool
     {
 
@@ -1089,8 +1385,39 @@ class Tickets
     }
 
     /**
+     * Whether the current user holds at least the given role IN a specific project.
+     *
+     * Leantime roles are project-scoped: Auth::userIsAtLeast() evaluates the role
+     * for the current *session* project, so it can't be trusted to authorize an
+     * action on an entity that lives in a different project. This resolves the
+     * user's effective role for $projectId — managers/admins/owners keep their
+     * global role across every project; otherwise the project role applies,
+     * falling back to the global role when no explicit project role is set — and
+     * compares it against the required role using the same ordering as Roles.
+     *
+     * @param  string  $role  Minimum role (a Roles::$* string).
+     * @param  int  $projectId  The project that owns the entity being changed.
+     */
+    private function userIsAtLeastForProject(string $role, int $projectId): bool
+    {
+        $globalRole = session('userdata.role');
+
+        // Manager+ (manager, admin, owner) keep their global role everywhere.
+        if (Roles::isAtLeast($globalRole, Roles::$manager)) {
+            $effectiveRole = $globalRole;
+        } else {
+            $projectRole = $this->projectService->getProjectRole(session('userdata.id'), $projectId);
+            // No explicit project role -> inherit the global role.
+            $effectiveRole = $projectRole === '' ? $globalRole : Roles::getRoleString((int) $projectRole);
+        }
+
+        return Roles::isAtLeast($effectiveRole, $role);
+    }
+
+    /**
      * @api
      */
+    #[RequiresPermission(TicketsPermissions::VIEW, projectIdParam: 'projectId')]
     public function getLastTickets($projectId, int $limit = 5): bool|array
     {
 
@@ -1115,12 +1442,19 @@ class Tickets
     }
 
     /**
-     * Retrieves the open tickets assigned to a user for a specific project
-     * that are due this week and later, with optional inclusion of completed
-     * tickets and milestones.
+     * Retrieves the open tickets assigned to a user that are due this week and later, optionally
+     * narrowed to a single project, with optional inclusion of completed tickets and milestones.
+     *
+     * This is a "my work" view (filtered by $userId). $projectId is optional: pass a project id to
+     * narrow to it (the dispatch gate then runs the per-project membership check), or omit it / pass
+     * 0 for the cross-project view mobile's Tasks tab uses. When no concrete project resolves, the
+     * enforcer has no project to scope to (the session project is null on Bearer), so tickets.view
+     * is evaluated against the user's global role — a user can always see their own assigned
+     * tickets. A mandatory $projectId here previously fail-closed (-32001 on 0, -32602 when omitted)
+     * for every role, breaking the mobile Tasks tab.
      *
      * @param  int  $userId  The ID of the user whose tickets are to be retrieved.
-     * @param  int  $projectId  The ID of the project for which tickets are to be retrieved.
+     * @param  int|string|null  $projectId  Optional project to narrow to; null/0/'' = across all the user's projects.
      * @param  bool  $includeDoneTickets  Whether to include tickets marked as done. Default is false.
      * @param  bool  $includeMilestones  Whether to include milestones in the results. Default is false.
      * @return array Returns an array of grouped tickets categorized by their due date (e.g.,
@@ -1128,7 +1462,8 @@ class Tickets
      *
      * @api
      */
-    public function getOpenUserTicketsThisWeekAndLater($userId, $projectId, bool $includeDoneTickets = false, bool $includeMilestones = false, ?int $limit = null, ?int $offset = null, ?string $group = null): array
+    #[RequiresPermission(TicketsPermissions::VIEW, projectIdParam: 'projectId')]
+    public function getOpenUserTicketsThisWeekAndLater($userId, $projectId = null, bool $includeDoneTickets = false, bool $includeMilestones = false, ?int $limit = null, ?int $offset = null, ?string $group = null): array
     {
 
         if ($includeDoneTickets === true) {
@@ -1229,7 +1564,8 @@ class Tickets
     /**
      * @api
      */
-    public function getOpenUserTicketsByProject($userId, $projectId, bool $includeMilestones = false, ?int $limit = null, ?int $offset = null, ?string $group = null): array
+    #[RequiresPermission(TicketsPermissions::VIEW, projectIdParam: 'projectId')]
+    public function getOpenUserTicketsByProject($userId, $projectId = null, bool $includeMilestones = false, ?int $limit = null, ?int $offset = null, ?string $group = null): array
     {
 
         $searchCriteria = $this->prepareTicketSearchArray(['currentProject' => $projectId, 'users' => $userId, 'status' => '', 'sprint' => '']);
@@ -1272,7 +1608,8 @@ class Tickets
     /**
      * @api
      */
-    public function getOpenUserTicketsByPriority($userId, $projectId, bool $includeMilestones = false, ?int $limit = null, ?int $offset = null, ?string $group = null): array
+    #[RequiresPermission(TicketsPermissions::VIEW, projectIdParam: 'projectId')]
+    public function getOpenUserTicketsByPriority($userId, $projectId = null, bool $includeMilestones = false, ?int $limit = null, ?int $offset = null, ?string $group = null): array
     {
 
         $searchCriteria = $this->prepareTicketSearchArray(['currentProject' => $projectId, 'users' => $userId, 'status' => '', 'sprint' => '']);
@@ -1330,7 +1667,8 @@ class Tickets
     /**
      * @api
      */
-    public function getOpenUserTicketsBySprint($userId, $projectId, bool $includeMilestones = false, ?int $limit = null, ?int $offset = null, ?string $group = null): array
+    #[RequiresPermission(TicketsPermissions::VIEW, projectIdParam: 'projectId')]
+    public function getOpenUserTicketsBySprint($userId, $projectId = null, bool $includeMilestones = false, ?int $limit = null, ?int $offset = null, ?string $group = null): array
     {
 
         $searchCriteria = $this->prepareTicketSearchArray(['currentProject' => $projectId, 'users' => $userId, 'status' => '', 'sprint' => '']);
@@ -1376,16 +1714,25 @@ class Tickets
     /**
      * Retrieves all milestones based on the provided search criteria and sort option.
      *
-     * @param  array  $searchCriteria  An array containing search parameters. Must include 'currentProject' with a valid project ID.
+     * @param  mixed  $searchCriteria  Search parameters (array). Must be scoped to a project — either a single
+     *                                 'currentProject' id (> 0) or a non-empty comma-separated 'projects'
+     *                                 set (used by program/cross-project boards).
      * @param  string  $sortBy  The sorting option for the milestones. Defaults to 'standard'.
-     * @return array|false Returns an array of milestones sorted hierarchically, or false if the search criteria are invalid.
+     * @return array Milestones sorted hierarchically; an empty array when the criteria are not project-scoped.
      *
      * @api
      */
-    public function getAllMilestones($searchCriteria, string $sortBy = 'standard'): array|false
+    #[RequiresPermission(TicketsPermissions::VIEW)]
+    public function getAllMilestones($searchCriteria, string $sortBy = 'standard'): array
     {
-        if (is_array($searchCriteria) && $searchCriteria['currentProject'] > 0) {
-            $items = $this->ticketRepository->getAllMilestones($searchCriteria, $sortBy);
+        // Proceed when scoped to a single project (currentProject) OR to a set of projects
+        // (the multi-project `projects` filter used by program boards). The currentProject
+        // access is null-coalesced so a projects-only criteria array doesn't warn.
+        $isScoped = is_array($searchCriteria)
+            && ((($searchCriteria['currentProject'] ?? 0) > 0) || ! empty($searchCriteria['projects']));
+
+        if ($isScoped) {
+            $items = $this->ticketRepository->getAllMilestones($searchCriteria, $sortBy) ?: [];
 
             return $this->sortItemsHierarchically($items);
         }
@@ -1475,7 +1822,7 @@ class Tickets
             return $flattened;
         }
 
-        return $tree;
+        return [];
     }
 
     private function sortTicketsWithinMilestone($tickets): array
@@ -1510,6 +1857,7 @@ class Tickets
     /**
      * @api
      */
+    #[RequiresPermission(TicketsPermissions::VIEW)]
     public function getAllMilestonesOverview(bool $includeArchived = false, string $sortBy = 'duedate', bool $includeTasks = false, int $clientId = 0, array $searchCriteria = []): false|array
     {
 
@@ -1546,6 +1894,7 @@ class Tickets
     /**
      * @api
      */
+    #[RequiresPermission(TicketsPermissions::VIEW)]
     public function getAllMilestonesByUserProjects($userId): array
     {
 
@@ -1589,6 +1938,7 @@ class Tickets
      *
      * @api
      */
+    #[RequiresPermission(TicketsPermissions::VIEW)]
     public function getMilestoneProgress(int|string $milestoneId): float
     {
 
@@ -1677,6 +2027,10 @@ class Tickets
         return $milestones;
     }
 
+    /**
+     * @internal Not exposed over JSON-RPC: $userId is caller-supplied and unverified, so it would
+     *           expose another user's work. The Welcome widget calls it for the session user.
+     */
     public function getRecentlyCompletedTicketsByUser(int $userId, ?int $projectId = null): array
     {
 
@@ -1720,6 +2074,10 @@ class Tickets
         return $doneTasks;
     }
 
+    /**
+     * @internal Not exposed over JSON-RPC: $userId is caller-supplied and unverified, so it would
+     *           expose another user's work. The Welcome widget calls it for the session user.
+     */
     public function goalsRelatedToWork(int $userId, $projectId = null)
     {
 
@@ -1761,11 +2119,57 @@ class Tickets
     /**
      * @api
      */
+    #[RequiresPermission(TicketsPermissions::VIEW)]
     public function getAllSubtasks(int $ticketId): false|array
     {
+        // Subtasks are read by parent id only, so fence on the parent: a caller who cannot see the
+        // parent ticket (or whose id names nothing) gets no children from another project.
+        if (! $this->getTicket($ticketId)) {
+            return [];
+        }
 
         // TODO: Refactor to be recursive
         return $this->ticketRepository->getAllSubtasks($ticketId);
+    }
+
+    /**
+     * Planned and logged hours of a To-Do's direct subtasks, so the parent can show totals
+     * "including subtasks" (#1798). Time logged on a subtask is booked against the subtask's own
+     * id, never the parent's, so adding these to the parent's own figures cannot double count.
+     *
+     * Only subtasks the current user may view are counted (a subtask can live in another project
+     * than its parent, e.g. after the parent was moved); subtaskCount is the number actually
+     * included. Logged hours come from one SUM query over the included ids.
+     *
+     * Internal (no RPC exposure): callers have already loaded and authorized the parent.
+     *
+     * @param  int  $ticketId  Parent To-Do id
+     * @return array{subtaskCount: int, planHours: float, loggedHours: float}
+     */
+    public function getSubtaskHourTotals(int $ticketId): array
+    {
+        $subtasks = $this->getAllSubtasks($ticketId) ?: [];
+
+        $canViewProject = [];
+        $includedIds = [];
+        $planHours = 0.0;
+        foreach ($subtasks as $subtask) {
+            $projectId = (int) ($subtask['projectId'] ?? 0);
+            $canViewProject[$projectId] ??= $this->can(TicketsPermissions::VIEW, $projectId);
+
+            if (! $canViewProject[$projectId]) {
+                continue;
+            }
+
+            $includedIds[] = (int) $subtask['id'];
+            $planHours += (float) ($subtask['planHours'] ?? 0);
+        }
+
+        return [
+            'subtaskCount' => count($includedIds),
+            'planHours' => $planHours,
+            'loggedHours' => $this->ticketRepository->sumLoggedHoursForTickets($includedIds),
+        ];
     }
 
     /**
@@ -1788,19 +2192,31 @@ class Tickets
      *
      * @api
      */
-    public function quickAddTicket($params): array|bool
+    #[RequiresPermission(TicketsPermissions::CREATE, entityScoped: true)]
+    public function quickAddTicket($params): array|bool|int
     {
+
+        $projectId = $params['projectId'] ?? session('currentProject');
+
+        $this->authorize(TicketsPermissions::CREATE, $projectId !== null ? (int) $projectId : null);
+
+        $this->assertParentTicketIsVisible($params['dependingTicketId'] ?? null, (int) $projectId);
+
+        // Status ids, label names ("New") and status types ("inprogress") are all accepted;
+        // anything unknown is rejected instead of being cast to 0 (= Done) (#3702).
+        $status = $this->resolveStatusInput($params['status'] ?? null, (int) $projectId, fallBackOnUnknownId: true)
+            ?? $this->defaultNewStatus((int) $projectId);
 
         $values = [
             'headline' => $params['headline'],
             'type' => $params['type'] ?? 'task',
             'description' => $params['description'] ?? '',
-            'projectId' => $params['projectId'] ?? session('currentProject'),
+            'projectId' => $projectId,
             'editorId' => $params['editorId'] ?? session('userdata.id'),
             'userId' => session('userdata.id') ?? $params['userId'] ?? null,
-            'date' => date('Y-m-d H:i:s'),
+            'date' => dtHelper()->dbNow()->formatDateTimeForDb(),
             'dateToFinish' => isset($params['dateToFinish']) ? strip_tags($params['dateToFinish']) : '',
-            'status' => isset($params['status']) ? (int) $params['status'] : 3,
+            'status' => $status,
             'storypoints' => isset($params['storypoints']) ? (int) $params['storypoints'] : '',
             'hourRemaining' => '',
             'planHours' => isset($params['planHours']) ? (int) $params['planHours'] : '',
@@ -1813,6 +2229,7 @@ class Tickets
             'milestoneid' => isset($params['milestone']) ? (int) $params['milestone'] : '',
             'dependingTicketId' => isset($params['dependingTicketId']) ? (int) $params['dependingTicketId'] : '',
             'sortIndex' => $params['sortIndex'] ?? '',
+            'collaborators' => $params['collaborators'] ?? [],
         ];
 
         if ($values['headline'] == '') {
@@ -1823,7 +2240,7 @@ class Tickets
 
         $result = $this->ticketRepository->addTicket($values);
 
-        self::dispatchEvent('ticket_created');
+        $this->dispatchTicketCreated($result, $values, $this->resolveTicketOrigin($params['origin'] ?? null, 'quickadd'), __FUNCTION__);
 
         if ($result > 0) {
             $values['id'] = $result;
@@ -1868,14 +2285,18 @@ class Tickets
      *
      * @api
      */
+    #[RequiresPermission(TicketsPermissions::CREATE, entityScoped: true)]
     public function quickAddMilestone(array $params): array|bool|int
     {
+        $projectId = $params['projectId'] ?? session('currentProject');
+
+        $this->authorize(TicketsPermissions::CREATE, $projectId !== null ? (int) $projectId : null);
 
         $values = [
             'headline' => $params['headline'],
             'type' => 'milestone',
             'description' => '',
-            'projectId' => $params['projectId'] ?? session('currentProject'),
+            'projectId' => $projectId,
             'editorId' => $params['editorId'] ?? session('userdata.id'),
             'userId' => session('userdata.id') ?? $params['userId'] ?? null,
             'date' => dtHelper()->userNow()->formatDateTimeForDb(),
@@ -1889,6 +2310,7 @@ class Tickets
             'dependingTicketId' => '',
             'milestoneid' => $params['dependentMilestone'] ?? '',
             'acceptanceCriteria' => '',
+            'outcomeImpact' => $params['outcomeImpact'] ?? '',
             'tags' => $params['tags'] ?? '',
             'editFrom' => $params['editFrom'] ?? '',
             'editTo' => $params['editTo'] ?? '',
@@ -1902,10 +2324,17 @@ class Tickets
             return $error;
         }
 
-        self::dispatchEvent('milestone_created');
-
         // $params is an array of field names. Exclude id
-        return $this->ticketRepository->addTicket($values);
+        $result = $this->ticketRepository->addTicket($values);
+
+        MilestoneCreated::dispatch(
+            milestoneId: is_int($result) && $result > 0 ? $result : null,
+            origin: $this->resolveTicketOrigin($params['origin'] ?? null, 'quickadd'),
+            projectId: is_numeric($projectId) ? (int) $projectId : null,
+            legacyHook: __FUNCTION__
+        );
+
+        return $result;
     }
 
     /**
@@ -1942,8 +2371,11 @@ class Tickets
      *
      * @api
      */
+    #[RequiresPermission(TicketsPermissions::CREATE, entityScoped: true)]
     public function addTicket($values): array|int|bool
     {
+        $origin = $this->resolveTicketOrigin($values['origin'] ?? null, 'modal');
+
         $values = [
             'id' => '',
             'headline' => $values['headline'] ?? '',
@@ -1955,7 +2387,7 @@ class Tickets
             'date' => gmdate('Y-m-d H:i:s'),
             'dateToFinish' => $values['dateToFinish'] ?? '',
             'timeToFinish' => $values['timeToFinish'] ?? '',
-            'status' => $values['status'] ?? 3,
+            'status' => $values['status'] ?? null,
             'planHours' => $values['planHours'] ?? '',
             'tags' => $values['tags'] ?? '',
             'sprint' => $values['sprint'] ?? '',
@@ -1963,6 +2395,7 @@ class Tickets
             'hourRemaining' => $values['hourRemaining'] ?? '',
             'priority' => $values['priority'] ?? '',
             'acceptanceCriteria' => $values['acceptanceCriteria'] ?? '',
+            'outcomeImpact' => $values['outcomeImpact'] ?? '',
             'editFrom' => $values['editFrom'] ?? '',
             'timeFrom' => $values['timeFrom'] ?? '',
             'editTo' => $values['editTo'] ?? '',
@@ -1972,9 +2405,17 @@ class Tickets
             'collaborators' => $values['collaborators'] ?? [],
         ];
 
-        if (! $this->projectService->isUserAssignedToProject(session('userdata.id'), $values['projectId'])) {
-            return ['msg' => 'notifications.ticket_save_error_no_access', 'type' => 'error'];
-        }
+        // Editor+ role in the target project AND access to it (engine combines capability +
+        // project membership). Replaces the previous access-only check, which let any
+        // assigned role create via RPC.
+        $this->authorize(TicketsPermissions::CREATE, (int) $values['projectId']);
+
+        $this->assertParentTicketIsVisible($values['dependingTicketId'], (int) $values['projectId']);
+
+        // New work defaults to the project's NEW status; label names and status types are
+        // resolved, unknown strings are rejected instead of becoming 0 (= Done) (#3702).
+        $values['status'] = $this->resolveStatusInput($values['status'], (int) $values['projectId'], fallBackOnUnknownId: true)
+            ?? $this->defaultNewStatus((int) $values['projectId']);
 
         if ($values['headline'] === '') {
             return ['msg' => 'notifications.ticket_save_error_no_headline', 'type' => 'error'];
@@ -1984,7 +2425,7 @@ class Tickets
             // Update Ticket
             $addTicketResponse = $this->ticketRepository->addTicket($values);
 
-            self::dispatchEvent('ticket_created');
+            $this->dispatchTicketCreated($addTicketResponse, $values, $origin, __FUNCTION__);
 
             if ($addTicketResponse !== false) {
                 $values['id'] = $addTicketResponse;
@@ -2042,29 +2483,58 @@ class Tickets
      *                         - 'timeTo': string|null, End time for ticket editing (optional).
      *                         - 'dependingTicketId': int|null, A ticket ID this ticket depends on (optional).
      *                         - 'milestoneid': int|null, The ID of the milestone associated with this ticket (optional).
+     *                         Fields that are not sent keep their stored value (partial update, #3701);
+     *                         send a field with an empty value to clear it.
      * @return array|bool Returns true if the ticket is successfully updated.
      *                    If an error occurs, an array with keys 'msg' and 'type' is returned. Returns false if the update operation fails.
      *
      * @api
      */
+    #[RequiresPermission(TicketsPermissions::EDIT, entityScoped: true)]
     public function updateTicket($values): array|bool
     {
+        // Server-side authorization. Editing is gated to editor+ in the UI, but the
+        // Kanban/Table modal path posted straight to updateTicket without enforcing it,
+        // letting commenter/reader roles edit tickets via a direct request (#3376).
+        //
+        // Authorize against the ticket's CURRENT project, not the session project.
+        // getTicket() returns false unless the user is assigned to the ticket's
+        // project, and the editor check is then evaluated against THAT project's
+        // role. Leantime roles are project-scoped, so an editor in project A who is
+        // only a commenter in project B must not be able to edit B's ticket by
+        // keeping the session on A and posting B's ticket id. (#3376 + review)
+        $currentTicket = $this->getTicket($values['id']);
+
+        if (! $currentTicket) {
+            return ['msg' => 'notifications.ticket_save_error_no_access', 'type' => 'error'];
+        }
+
+        if (! $this->userIsAtLeastForProject(Roles::$editor, (int) $currentTicket->projectId)) {
+            return ['msg' => 'notifications.ticket_save_error_no_access', 'type' => 'error'];
+        }
+
         if (! isset($values['headline'])) {
-            $currentTicket = $this->getTicket($values['id']);
-
-            if (! $currentTicket) {
-                return ['msg' => 'This ticket id does not exist within your leantime account.', 'type' => 'error'];
-            }
-
             $values['headline'] = $currentTicket->headline;
         }
+
+        // Only touch the outcome narrative when the caller sends it — most edit forms don't
+        // carry the field, and defaulting it to '' would wipe a saved milestone outcome
+        // (the repository skips the column when the key is absent).
+        $hasOutcomeImpact = array_key_exists('outcomeImpact', $values);
+        $outcomeImpact = $values['outcomeImpact'] ?? null;
+
+        // Remember exactly which fields the caller sent: anything absent keeps its stored value
+        // below (partial-update semantics, #3701). The creation timestamp ("date") is never taken
+        // from an update payload, so it is always preserved.
+        $submittedValues = $values;
+        unset($submittedValues['date']);
 
         $values = [
             'id' => $values['id'],
             'headline' => $values['headline'] ?? '',
             'type' => $values['type'] ?? '',
             'description' => $values['description'] ?? '',
-            'projectId' => $values['projectId'] ?? session('currentProject'),
+            'projectId' => $values['projectId'] ?? $currentTicket->projectId,
             'editorId' => $values['editorId'] ?? '',
             'date' => dtHelper()->userNow()->formatDateTimeForDb(),
             'dateToFinish' => $values['dateToFinish'] ?? '',
@@ -2086,6 +2556,10 @@ class Tickets
             'collaborators' => $values['collaborators'] ?? [],
         ];
 
+        if ($hasOutcomeImpact) {
+            $values['outcomeImpact'] = $outcomeImpact;
+        }
+
         if ($values['projectId'] === null || $values['projectId'] === '' || $values['projectId'] === false) {
             return ['msg' => 'project id is not set', 'type' => 'error'];
         }
@@ -2094,13 +2568,50 @@ class Tickets
             return ['msg' => 'notifications.ticket_save_error_no_access', 'type' => 'error'];
         }
 
+        // Moving the ticket needs edit rights in the TARGET project, not just membership there
+        // (mirrors patch()); otherwise a reader could push tickets into that project.
+        if ((int) $values['projectId'] !== (int) $currentTicket->projectId
+            && ! $this->can(TicketsPermissions::EDIT, (int) $values['projectId'])) {
+            return ['msg' => 'notifications.ticket_save_error_no_access', 'type' => 'error'];
+        }
+
+        // A newly set parent must be a ticket the caller can see, like on create (#3702).
+        if (array_key_exists('dependingTicketId', $submittedValues)
+            && (int) $submittedValues['dependingTicketId'] !== (int) $currentTicket->dependingTicketId) {
+            $this->assertParentTicketIsVisible($submittedValues['dependingTicketId'], (int) $values['projectId']);
+        }
+
+        // On a move, links that belong to the old project (parent, milestone, sprint) are cleared
+        // unless the caller set them; explicitly set milestone/sprint must belong to the target.
+        foreach ($this->clearForeignProjectLinksOnMove($currentTicket, (int) $values['projectId'], $submittedValues) as $field => $clearedValue) {
+            $values[$field] = $clearedValue;
+            $submittedValues[$field] = $clearedValue;
+        }
+
+        // An empty status means "unchanged"; names/types are resolved, unknown strings rejected (#3702).
+        if (array_key_exists('status', $submittedValues)) {
+            $values['status'] = $this->resolveStatusInput($submittedValues['status'], (int) $values['projectId']);
+            if ($values['status'] === null) {
+                unset($submittedValues['status']);
+            }
+        }
+
+        // Moving without a status: status ids are project-specific, so map the current status to
+        // the target project's status of the same type instead of carrying the source id over.
+        if (! array_key_exists('status', $submittedValues) && (int) $values['projectId'] !== (int) $currentTicket->projectId) {
+            $values['status'] = $this->mapStatusToProject($currentTicket, (int) $values['projectId']);
+            $submittedValues['status'] = $values['status'];
+        }
+
         $values = $this->prepareTicketDates($values);
+
+        $values = $this->keepStoredValuesForOmittedFields($values, $submittedValues, $currentTicket);
 
         // Update Ticket
         if ($this->ticketRepository->updateTicket($values, $values['id']) === true) {
             $subject = sprintf($this->language->__('email_notifications.todo_update_subject'), $values['id'], strip_tags($values['headline']));
             $actual_link = BASE_URL.'/dashboard/home#/tickets/showTicket/'.$values['id'];
-            $message = sprintf($this->language->__('email_notifications.todo_update_message'), session('userdata.name'), $values['headline']);
+            $message = sprintf($this->language->__('email_notifications.todo_update_message'), session('userdata.name'), strip_tags($values['headline']));
 
             $notification = new NotificationModel;
             $notification->url = [
@@ -2117,12 +2628,697 @@ class Tickets
 
             $this->projectService->notifyProjectUsers($notification);
 
-            self::dispatchEvent('ticket_updated');
+            TicketUpdated::dispatch(ticketId: (int) $values['id'], legacyHook: __FUNCTION__);
+
+            $this->dispatchTicketChangeEvents((int) $values['id'], $currentTicket, $values);
+
+            // Only a status change can stop the timer; an omitted status is the stored one (#3701).
+            if (array_key_exists('status', $submittedValues)) {
+                $this->dispatchTicketCompletedOnTransition(
+                    (int) $values['id'],
+                    $currentTicket->status,
+                    (int) $currentTicket->projectId,
+                    $values['status'],
+                    (int) $values['projectId'],
+                    $currentTicket
+                );
+                $this->stopTimerWhenTicketIsDone((int) $values['id'], $values['status'], (int) $values['projectId']);
+            }
 
             return true;
         }
 
         return false;
+    }
+
+    /**
+     * Batch variant of {@see dispatchTicketCompletedOnTransition()} for a kanban write.
+     *
+     * @param  array<int, int|string>  $newStatusByTicket  Ticket id => new status key (changed tickets only).
+     * @param  array<int, string|null>  $previousStatusByTicket  Ticket id => status key before the write.
+     * @param  array<int, int>  $projectIdByTicket  Ticket id => project id (a kanban move keeps the project).
+     * @param  array<int, TicketModel>  $ticketsBefore  Ticket id => the ticket as read before the write.
+     */
+    private function dispatchTicketCompletedForStatusChanges(array $newStatusByTicket, array $previousStatusByTicket, array $projectIdByTicket, array $ticketsBefore = []): void
+    {
+        foreach ($newStatusByTicket as $ticketId => $newStatus) {
+            $projectId = $projectIdByTicket[$ticketId] ?? 0;
+
+            $this->dispatchTicketCompletedOnTransition(
+                (int) $ticketId,
+                $previousStatusByTicket[$ticketId] ?? null,
+                $projectId,
+                $newStatus,
+                $projectId,
+                $ticketsBefore[$ticketId] ?? null
+            );
+        }
+    }
+
+    /**
+     * Fire {@see TicketCompleted} when a persisted status change moved a ticket INTO a status of
+     * type DONE from a status that was not DONE. Status keys are project-specific, so each side is
+     * looked up in its own project's labels (a move can change the project in the same write).
+     *
+     * Fires at most once per ticket per service instance, so a request that persists the same
+     * transition twice does not report two completions.
+     *
+     * @param  int  $ticketId  The ticket whose status was written.
+     * @param  int|string|null  $previousStatus  The status key before the write.
+     * @param  int  $previousProjectId  The ticket's project before the write.
+     * @param  int|string|null  $newStatus  The status key that was written.
+     * @param  int  $newProjectId  The ticket's project after the write.
+     * @param  TicketModel|null  $ticketBefore  The ticket as read before the write, for the event's context
+     *                                          (type, assignee, dates); without it those keep their defaults.
+     */
+    private function dispatchTicketCompletedOnTransition(
+        int $ticketId,
+        int|string|null $previousStatus,
+        int $previousProjectId,
+        int|string|null $newStatus,
+        int $newProjectId,
+        ?TicketModel $ticketBefore = null
+    ): void {
+        if (isset($this->completedTicketIds[$ticketId])) {
+            return;
+        }
+
+        if ($this->statusTypeOf($newStatus, $newProjectId) !== 'DONE') {
+            return;
+        }
+
+        if ($this->statusTypeOf($previousStatus, $previousProjectId) === 'DONE') {
+            return;
+        }
+
+        $this->completedTicketIds[$ticketId] = true;
+
+        $projectId = $newProjectId > 0 ? $newProjectId : null;
+
+        if (! $ticketBefore instanceof TicketModel) {
+            TicketCompleted::dispatch(ticketId: $ticketId, projectId: $projectId);
+
+            return;
+        }
+
+        $type = strtolower((string) ($ticketBefore->type ?: 'task'));
+        if ($type === 'task' && (int) $ticketBefore->dependingTicketId > 0) {
+            $type = 'subtask';
+        }
+
+        $now = CarbonImmutable::now('UTC');
+        $createdAt = $this->parseDbDateTimeOrNull($ticketBefore->date);
+        $dueAt = $this->parseDbDateTimeOrNull($ticketBefore->dateToFinish);
+        $plannedStart = $this->parseDbDateTimeOrNull($ticketBefore->editFrom);
+
+        $wasScheduledToday = false;
+        if ($plannedStart !== null) {
+            $userTimezone = (string) (session('usersettings.timezone') ?: 'UTC');
+            $wasScheduledToday = $plannedStart->setTimezone($userTimezone)->toDateString() === $now->setTimezone($userTimezone)->toDateString();
+        }
+
+        TicketCompleted::dispatch(
+            ticketId: $ticketId,
+            projectId: $projectId,
+            type: $type,
+            completedByAssignee: (int) $ticketBefore->editorId > 0 && (int) $ticketBefore->editorId === (int) session('userdata.id'),
+            daysToComplete: $createdAt !== null ? (int) floor(abs($now->getTimestamp() - $createdAt->getTimestamp()) / 86400) : null,
+            hadDueDate: $dueAt !== null,
+            wasOverdue: $dueAt !== null && $dueAt->lessThan($now),
+            wasScheduledToday: $wasScheduledToday,
+        );
+    }
+
+    /**
+     * A stored UTC datetime ('Y-m-d H:i:s') as a CarbonImmutable, or null for empty, zero
+     * ('0000-00-00 ...') or unparseable values.
+     *
+     * @param  mixed  $value  The stored value.
+     */
+    private function parseDbDateTimeOrNull(mixed $value): ?CarbonImmutable
+    {
+        if ($value instanceof CarbonInterface) {
+            return CarbonImmutable::instance($value)->setTimezone('UTC');
+        }
+
+        if (! is_string($value) || trim($value) === '' || str_starts_with($value, '0000-00-00')) {
+            return null;
+        }
+
+        try {
+            return CarbonImmutable::parse($value, 'UTC');
+        } catch (\Throwable) {
+            return null;
+        }
+    }
+
+    /**
+     * Report scheduling and assignment changes of a persisted ticket write by diffing the stored
+     * ticket read before the write against the values written ({@see TicketScheduled},
+     * {@see TicketAssigned}). Only fields present in $written are compared, so partial patches
+     * report only what they touched.
+     *
+     * @param  int  $ticketId  The written ticket.
+     * @param  TicketModel  $ticketBefore  The ticket as read before the write.
+     * @param  array<string, mixed>  $written  The field => value pairs that were written (DB format).
+     */
+    private function dispatchTicketChangeEvents(int $ticketId, TicketModel $ticketBefore, array $written): void
+    {
+        $projectId = (int) ($written['projectId'] ?? $ticketBefore->projectId);
+        $projectId = $projectId > 0 ? $projectId : null;
+
+        if (array_key_exists('editFrom', $written) || array_key_exists('editTo', $written)) {
+            $previousFrom = $this->normalizedDbDateTime($ticketBefore->editFrom);
+            $previousTo = $this->normalizedDbDateTime($ticketBefore->editTo);
+            $newFrom = array_key_exists('editFrom', $written) ? $this->normalizedDbDateTime($written['editFrom']) : $previousFrom;
+            $newTo = array_key_exists('editTo', $written) ? $this->normalizedDbDateTime($written['editTo']) : $previousTo;
+
+            $this->dispatchTicketScheduledOnChange($ticketId, $projectId, $previousFrom, $previousTo, $newFrom, $newTo);
+        }
+
+        if (array_key_exists('editorId', $written)) {
+            $this->dispatchTicketAssignedOnChange($ticketId, $projectId, $ticketBefore->editorId, $written['editorId']);
+        }
+
+        $previousParent = (int) $ticketBefore->dependingTicketId;
+        $newParent = array_key_exists('dependingTicketId', $written) ? (int) $written['dependingTicketId'] : $previousParent;
+        if ($previousParent > 0) {
+            SubtasksUpdated::dispatch(parentTicketId: $previousParent);
+        }
+        if ($newParent > 0 && $newParent !== $previousParent) {
+            SubtasksUpdated::dispatch(parentTicketId: $newParent);
+        }
+    }
+
+    /**
+     * Fire {@see TicketScheduled} when the work window changed to a value with a start or end.
+     * Clearing the window does not fire.
+     *
+     * @param  int  $ticketId  The ticket.
+     * @param  int|null  $projectId  Its project.
+     * @param  string|null  $previousFrom  Start before the write (normalised).
+     * @param  string|null  $previousTo  End before the write (normalised).
+     * @param  string|null  $newFrom  Start after the write (normalised).
+     * @param  string|null  $newTo  End after the write (normalised).
+     */
+    private function dispatchTicketScheduledOnChange(int $ticketId, ?int $projectId, ?string $previousFrom, ?string $previousTo, ?string $newFrom, ?string $newTo): void
+    {
+        if ($newFrom === null && $newTo === null) {
+            return;
+        }
+
+        if ($newFrom === $previousFrom && $newTo === $previousTo) {
+            return;
+        }
+
+        $scheduleKey = ($newFrom ?? '').'|'.($newTo ?? '');
+        if (($this->reportedSchedules[$ticketId] ?? null) === $scheduleKey) {
+            return;
+        }
+        $this->reportedSchedules[$ticketId] = $scheduleKey;
+
+        TicketScheduled::dispatch(
+            ticketId: $ticketId,
+            projectId: $projectId,
+            editFrom: $newFrom,
+            editTo: $newTo,
+            rescheduled: $previousFrom !== null || $previousTo !== null,
+        );
+    }
+
+    /**
+     * Fire {@see TicketAssigned} when the assignee changed to a different, non-empty user.
+     *
+     * @param  int  $ticketId  The ticket.
+     * @param  int|null  $projectId  Its project.
+     * @param  mixed  $previousAssignee  The editorId before the write (null/'' on creation).
+     * @param  mixed  $newAssignee  The editorId that was written.
+     */
+    private function dispatchTicketAssignedOnChange(int $ticketId, ?int $projectId, mixed $previousAssignee, mixed $newAssignee): void
+    {
+        $assigneeId = is_numeric($newAssignee) ? (int) $newAssignee : 0;
+        $previousAssigneeId = is_numeric($previousAssignee) && (int) $previousAssignee > 0 ? (int) $previousAssignee : null;
+
+        if ($assigneeId <= 0 || $assigneeId === $previousAssigneeId) {
+            return;
+        }
+
+        if (($this->reportedAssignees[$ticketId] ?? null) === $assigneeId) {
+            return;
+        }
+        $this->reportedAssignees[$ticketId] = $assigneeId;
+
+        TicketAssigned::dispatch(
+            ticketId: $ticketId,
+            projectId: $projectId,
+            assigneeId: $assigneeId,
+            previousAssigneeId: $previousAssigneeId,
+            assignedToSelf: $assigneeId === (int) session('userdata.id'),
+        );
+    }
+
+    /**
+     * A stored datetime normalised for comparison ('Y-m-d H:i:s'), or null when empty/zero.
+     *
+     * @param  mixed  $value  The stored or written value.
+     */
+    private function normalizedDbDateTime(mixed $value): ?string
+    {
+        return $this->parseDbDateTimeOrNull($value)?->format('Y-m-d H:i:s');
+    }
+
+    /**
+     * Report a ticket creation: {@see TicketCreated} (with its context) and, when the ticket was
+     * created with an assignee, {@see TicketAssigned}.
+     *
+     * @param  mixed  $result  The repository result (the new id, or false).
+     * @param  array<string, mixed>  $values  The values the ticket was created with.
+     * @param  string  $origin  Where the ticket was created ({@see resolveTicketOrigin()}).
+     * @param  string  $legacyHook  The emitting method (for the legacy string name).
+     */
+    private function dispatchTicketCreated(mixed $result, array $values, string $origin, string $legacyHook): void
+    {
+        $ticketId = is_int($result) && $result > 0 ? $result : null;
+        if ($ticketId === null) {
+            return; // the write failed: nothing was created
+        }
+
+        $assigneeId = is_numeric($values['editorId'] ?? null) ? (int) $values['editorId'] : 0;
+        $projectId = (int) ($values['projectId'] ?? 0);
+
+        TicketCreated::dispatch(
+            ticketId: $ticketId,
+            origin: $origin,
+            type: (string) (($values['type'] ?? '') ?: 'task'),
+            hasDueDate: $this->parseDbDateTimeOrNull($values['dateToFinish'] ?? null) !== null,
+            assignedToOther: $assigneeId > 0 && $assigneeId !== (int) session('userdata.id'),
+            projectId: $projectId > 0 ? $projectId : null,
+            legacyHook: $legacyHook
+        );
+
+        $this->dispatchTicketAssignedOnChange($ticketId, $projectId > 0 ? $projectId : null, null, $assigneeId);
+    }
+
+    /**
+     * The origin a caller declared for a ticket creation (a short lowercase key such as 'mcp',
+     * 'import' or 'todo_widget'), or the service method's default.
+     *
+     * @param  mixed  $declaredOrigin  The caller-supplied `origin` value, if any.
+     * @param  string  $default  The origin of the service entry point.
+     */
+    private function resolveTicketOrigin(mixed $declaredOrigin, string $default): string
+    {
+        if (is_string($declaredOrigin) && preg_match('/^[a-z_]{1,32}$/', $declaredOrigin) === 1) {
+            return $declaredOrigin;
+        }
+
+        return $default;
+    }
+
+    /**
+     * The statusType (NEW, INPROGRESS, DONE, ...) of a status key in a project, or '' when the key
+     * is empty, non-numeric or not defined in the project.
+     *
+     * @param  int|string|null  $status  The status key.
+     * @param  int  $projectId  The project whose status labels apply.
+     */
+    private function statusTypeOf(int|string|null $status, int $projectId): string
+    {
+        if ($status === null || $status === '' || ! is_numeric($status)) {
+            return '';
+        }
+
+        $statusLabels = $this->ticketRepository->getStateLabels($projectId);
+
+        return (string) ($statusLabels[(int) $status]['statusType'] ?? '');
+    }
+
+    /**
+     * Batch variant of {@see stopTimerWhenTicketIsDone()}: stops the current user's timer when its
+     * ticket is among the tickets that just received a new status.
+     *
+     * @param  array<int, int|string>  $newStatusByTicket  Ticket id => new status key.
+     */
+    private function stopTimerForTicketsMarkedDone(array $newStatusByTicket): void
+    {
+        $currentUserId = (int) session('userdata.id');
+        if ($currentUserId === 0 || $newStatusByTicket === []) {
+            return;
+        }
+
+        $onTheClock = $this->timesheetService->isClocked($currentUserId);
+        $clockedTicketId = $onTheClock === false ? 0 : (int) ($onTheClock['id'] ?? 0);
+        if (! isset($newStatusByTicket[$clockedTicketId])) {
+            return;
+        }
+
+        $clockedTicket = $this->getTicket($clockedTicketId);
+        if (! $clockedTicket) {
+            return;
+        }
+
+        $this->stopTimerWhenTicketIsDone($clockedTicketId, $newStatusByTicket[$clockedTicketId], (int) $clockedTicket->projectId);
+    }
+
+    /**
+     * Stop the current user's running timer on a ticket that was just moved to a DONE-type status
+     * and book the elapsed time (#415). Work on a finished To-Do is over, and a timer left running
+     * blocks starting one on the next task.
+     *
+     * Only the session user's own timer is touched, and only when it runs on this ticket. A
+     * failure to book never fails the status change itself.
+     *
+     * @param  int  $ticketId  The ticket whose status changed.
+     * @param  int|string|null  $newStatus  The status key the ticket now has.
+     * @param  int  $projectId  The ticket's project (status keys are project-specific).
+     */
+    private function stopTimerWhenTicketIsDone(int $ticketId, int|string|null $newStatus, int $projectId): void
+    {
+        if ($newStatus === null || $newStatus === '' || ! is_numeric($newStatus)) {
+            return;
+        }
+
+        $currentUserId = (int) session('userdata.id');
+        if ($currentUserId === 0) {
+            return;
+        }
+
+        $statusLabels = $this->ticketRepository->getStateLabels($projectId);
+        $newStatusType = $statusLabels[(int) $newStatus]['statusType'] ?? '';
+        if ($newStatusType !== 'DONE') {
+            return;
+        }
+
+        $onTheClock = $this->timesheetService->isClocked($currentUserId);
+        if ($onTheClock === false || (int) ($onTheClock['id'] ?? 0) !== $ticketId) {
+            return;
+        }
+
+        try {
+            $this->timesheetService->punchOut($ticketId, automatic: true);
+        } catch (\Throwable $e) {
+            Log::error($e);
+        }
+    }
+
+    /**
+     * Resolve a caller-supplied ticket status to a status id of the given project (#3702).
+     *
+     * Accepts a status id defined in the project (int or integer string), a status label name as shown in the project
+     * ("New", "In Progress", a custom label, or the raw language key "status.new"), or a status
+     * type ("new", "inprogress", "done"). Previously any non-numeric string was cast to 0, which is
+     * the Done status, so "New" silently completed new work.
+     *
+     * On create paths ($fallBackOnUnknownId) an unknown NUMERIC id resolves to null so the caller
+     * uses the project's NEW status, with a warning logged: CSV/connector imports send default ids
+     * (e.g. 3) into projects with custom status sets and must keep working. Updates stay strict —
+     * an explicit change to a status that does not exist fails.
+     *
+     * @param  mixed  $status  The submitted status.
+     * @param  int  $projectId  The project whose status labels apply.
+     * @param  bool  $fallBackOnUnknownId  Create path: unknown numeric ids resolve to null instead of failing.
+     * @return int|null The status id, or null when no status was submitted (null or '') or an unknown id falls back.
+     *
+     * @throws ValidationException When the status does not name a status of the project.
+     */
+    private function resolveStatusInput(mixed $status, int $projectId, bool $fallBackOnUnknownId = false): ?int
+    {
+        if ($status === null || $status === '') {
+            return null;
+        }
+
+        $labels = $this->ticketRepository->getStateLabels($projectId);
+
+        // Numeric input must be a whole number AND a status that exists in this project; an id
+        // from another project's custom set (or 3.5, true, ...) is rejected, not stored (#3702).
+        $statusId = match (true) {
+            is_int($status) => $status,
+            is_float($status) && floor($status) === $status => (int) $status,
+            is_string($status) && preg_match('/^\s*-?\d+\s*$/', $status) === 1 => (int) trim($status),
+            default => null,
+        };
+
+        if ($statusId !== null) {
+            if (array_key_exists($statusId, $labels)) {
+                return $statusId;
+            }
+
+            if ($fallBackOnUnknownId) {
+                Log::warning("Ticket status {$statusId} does not exist in project {$projectId}; using the project's NEW status instead.");
+
+                return null;
+            }
+
+            $this->throwUnknownStatus((string) $statusId, $labels);
+        }
+
+        if (! is_string($status) || is_numeric(trim($status))) {
+            $message = 'The status must be a whole-number status id, a status name or a status type.';
+
+            throw new ValidationException(['status' => [$message]], $message);
+        }
+
+        $status = trim($status);
+        $normalize = fn (string $value): string => (string) preg_replace('/[\s_\-]+/', '', strtolower(trim($value)));
+        $wanted = $normalize($status);
+
+        foreach ($labels as $labelStatusId => $label) {
+            $name = (string) ($label['name'] ?? '');
+            $candidates = [$name, $this->language->__($name), (string) preg_replace('/^status\./', '', $name)];
+
+            foreach ($candidates as $candidate) {
+                if ($candidate !== '' && $normalize($candidate) === $wanted) {
+                    return (int) $labelStatusId;
+                }
+            }
+        }
+
+        $statusTypes = ['new' => 'NEW', 'inprogress' => 'INPROGRESS', 'done' => 'DONE'];
+        if (isset($statusTypes[$wanted])) {
+            $typeStatusId = $this->resolveProjectStatusKeyForType($projectId, $statusTypes[$wanted]);
+            if ($typeStatusId !== null) {
+                return $typeStatusId;
+            }
+        }
+
+        $this->throwUnknownStatus($status, $labels);
+    }
+
+    /**
+     * Reject a status that is not defined for the project, listing the valid ones.
+     *
+     * @param  string  $status  The submitted status (for the message).
+     * @param  array<int, array<string, mixed>>  $labels  The project's status labels.
+     *
+     * @throws ValidationException Always.
+     */
+    private function throwUnknownStatus(string $status, array $labels): never
+    {
+        $knownStatuses = [];
+        foreach ($labels as $statusId => $label) {
+            $knownStatuses[] = $statusId.' ('.$this->language->__((string) ($label['name'] ?? '')).')';
+        }
+
+        $message = "Unknown status '{$status}'. Use a status id of this project (".implode(', ', $knownStatuses).') or a status type: new, inprogress, done.';
+
+        throw new ValidationException(['status' => [$message]], $message);
+    }
+
+    /**
+     * The target project's status for a ticket that moves there without an explicit status.
+     *
+     * Status ids are project-specific (4 may be "In Progress" in one project and "Done" in
+     * another), so the ticket's current status TYPE is mapped to the target project's status of
+     * that type; when the type is unknown or missing there, the target's NEW status is used.
+     *
+     * @param  TicketModel  $ticket  The ticket as currently stored.
+     * @param  int  $targetProjectId  The project the ticket moves to.
+     * @return int A status id that exists in the target project.
+     */
+    private function mapStatusToProject(TicketModel $ticket, int $targetProjectId): int
+    {
+        $sourceLabels = $this->ticketRepository->getStateLabels((int) $ticket->projectId);
+        $statusType = (string) ($sourceLabels[(int) $ticket->status]['statusType'] ?? '');
+
+        if (in_array($statusType, ['NEW', 'INPROGRESS', 'DONE'], true)) {
+            $mappedStatus = $this->resolveProjectStatusKeyForType($targetProjectId, $statusType);
+            if ($mappedStatus !== null) {
+                return $mappedStatus;
+            }
+        }
+
+        return $this->defaultNewStatus($targetProjectId);
+    }
+
+    /**
+     * The status new work starts in: the project's first NEW-type status, falling back to 3.
+     *
+     * Custom projects can repurpose status 3, so the default comes from the project's status
+     * configuration rather than being hardcoded.
+     *
+     * @param  int  $projectId  The project the ticket is created in.
+     * @return int The default status id.
+     */
+    private function defaultNewStatus(int $projectId): int
+    {
+        if ($projectId <= 0) {
+            return 3;
+        }
+
+        foreach ($this->ticketRepository->getStateLabels($projectId) as $statusId => $config) {
+            if (($config['statusType'] ?? '') === 'NEW') {
+                return (int) $statusId;
+            }
+        }
+
+        return 3;
+    }
+
+    /**
+     * Project-scoped links to clear when a ticket moves to another project.
+     *
+     * Parent (dependingTicketId), milestone and sprint ids point at entities of a single project.
+     * When the ticket moves and the caller did not set one of them in the same call, a link that
+     * is not valid in the target project is cleared (logged) so it neither exposes the old
+     * project's entities nor dangles. A milestone or sprint the caller sets explicitly during the
+     * move must belong to the target project (sprints include ones the project inherits).
+     *
+     * @param  TicketModel  $ticket  The ticket as currently stored.
+     * @param  int  $targetProjectId  The project the ticket ends up in.
+     * @param  array<string, mixed>  $submittedValues  The fields the caller sent.
+     * @return array<string, string> Field => '' for each link to clear.
+     *
+     * @throws ValidationException When an explicitly set milestone or sprint is not in the target project.
+     */
+    private function clearForeignProjectLinksOnMove(TicketModel $ticket, int $targetProjectId, array $submittedValues): array
+    {
+        if ((int) $ticket->projectId === $targetProjectId) {
+            return [];
+        }
+
+        $isLinkValidInTarget = [
+            'dependingTicketId' => function (int $parentId) use ($targetProjectId): bool {
+                $parentTicket = $this->ticketRepository->getTicket($parentId);
+
+                return $parentTicket && (int) $parentTicket->projectId === $targetProjectId;
+            },
+            'milestoneid' => function (int $milestoneId) use ($targetProjectId): bool {
+                $milestone = $this->ticketRepository->getTicket($milestoneId);
+
+                return $milestone && $milestone->type === 'milestone' && (int) $milestone->projectId === $targetProjectId;
+            },
+            'sprint' => function (int $sprintId) use ($targetProjectId): bool {
+                foreach ($this->sprintService->getAllSprints($targetProjectId) as $sprint) {
+                    if ((int) $sprint->id === $sprintId) {
+                        return true;
+                    }
+                }
+
+                return false;
+            },
+        ];
+
+        $cleared = [];
+        foreach ($isLinkValidInTarget as $field => $isValid) {
+            $isSubmitted = array_key_exists($field, $submittedValues)
+                && (int) $submittedValues[$field] !== (int) $ticket->$field;
+
+            if ($isSubmitted) {
+                // The parent has its own check (assertParentTicketIsVisible); a milestone or sprint
+                // set during the move must exist in the target project.
+                $submittedId = (int) $submittedValues[$field];
+                if ($field !== 'dependingTicketId' && $submittedId > 0 && ! $isValid($submittedId)) {
+                    $message = "The {$field} {$submittedId} does not belong to project {$targetProjectId}.";
+
+                    throw new ValidationException([$field => [$message]], $message);
+                }
+
+                continue;
+            }
+
+            $currentId = (int) $ticket->$field;
+            if ($currentId <= 0 || $isValid($currentId)) {
+                continue;
+            }
+
+            Log::info("Ticket {$ticket->id} moved to project {$targetProjectId}; cleared {$field} {$currentId}, which is not in that project.");
+            $cleared[$field] = '';
+        }
+
+        return $cleared;
+    }
+
+    /**
+     * A ticket may only be linked under a visible parent in its own project (#3702).
+     *
+     * Subtasks are listed by parent id and listings expose the parent's headline to everyone who
+     * can see the child, so the parent must exist, be accessible to the caller, and live in the
+     * same project as the child; otherwise a parent from another project would leak to that
+     * project's members.
+     *
+     * @param  mixed  $parentTicketId  The submitted dependingTicketId (empty = no parent).
+     * @param  int  $childProjectId  The project the child ticket is (or will be) in.
+     *
+     * @throws ValidationException When the parent is missing, not visible, or in another project.
+     */
+    private function assertParentTicketIsVisible(mixed $parentTicketId, int $childProjectId): void
+    {
+        if ($parentTicketId === null || $parentTicketId === '' || (int) $parentTicketId <= 0) {
+            return;
+        }
+
+        $parentTicket = $this->getTicket((int) $parentTicketId);
+        if (! $parentTicket) {
+            $message = "Parent ticket {$parentTicketId} does not exist or is not accessible.";
+
+            throw new ValidationException(['dependingTicketId' => [$message]], $message);
+        }
+
+        if ((int) $parentTicket->projectId !== $childProjectId) {
+            $message = "Parent ticket {$parentTicketId} belongs to another project; a parent must be in the same project as its subtask.";
+
+            throw new ValidationException(['dependingTicketId' => [$message]], $message);
+        }
+    }
+
+    /**
+     * Partial-update semantics for full-row ticket writes (#3701).
+     *
+     * updateTicket() and the upsertSubtask() update branch rebuild the whole zp_tickets row, so a
+     * field the caller did not send used to be written back as '' — clearing descriptions, tags and
+     * dates, resetting the type to "task" and severing a subtask from its parent
+     * (dependingTicketId). Every field that was NOT submitted now keeps the value currently stored
+     * on the ticket. Applied after prepareTicketDates() so stored (DB-format, UTC) dates are copied
+     * verbatim instead of being re-parsed as user input.
+     *
+     * @param  array<string, mixed>  $values  The prepared row about to be written.
+     * @param  array<string, mixed>  $submittedValues  The raw values the caller sent.
+     * @param  TicketModel  $currentTicket  The ticket as currently stored.
+     * @return array<string, mixed> The row with omitted fields restored from the stored ticket.
+     */
+    private function keepStoredValuesForOmittedFields(array $values, array $submittedValues, TicketModel $currentTicket): array
+    {
+        $rowFields = [
+            'headline', 'type', 'description', 'projectId', 'editorId', 'date', 'dateToFinish', 'status',
+            'planHours', 'tags', 'sprint', 'storypoints', 'hourRemaining', 'priority',
+            'acceptanceCriteria', 'editFrom', 'editTo', 'dependingTicketId', 'milestoneid',
+        ];
+
+        foreach ($rowFields as $field) {
+            if (array_key_exists($field, $submittedValues)) {
+                continue;
+            }
+
+            $values[$field] = $currentTicket->$field;
+        }
+
+        // Collaborators live in a relation table that the repository rewrites on every update, so
+        // an omitted list must carry the current collaborators rather than clear them.
+        if (! array_key_exists('collaborators', $submittedValues)) {
+            $values['collaborators'] = is_array($currentTicket->collaborators ?? null) ? $currentTicket->collaborators : [];
+        }
+
+        return $values;
     }
 
     /**
@@ -2160,6 +3356,487 @@ class Tickets
      *
      * @api
      */
+    /**
+     * @api
+     *
+     * Convenience method for "mark this ticket done" without the client
+     * needing to know the project's status ID for DONE. Looks up the
+     * project's status config, finds the first status with statusType
+     * === 'DONE', and patches the ticket's status to that ID.
+     *
+     * The mobile app calls this from its list-view quick-complete
+     * checkbox; without it, mobile would have to preload every project's
+     * status config just to mark a single task as done.
+     *
+     * Returns true on success, false if the ticket doesn't exist or the
+     * project has no DONE-type status configured.
+     */
+    /**
+     * @api
+     *
+     * Inverse of getAllOpenUserTickets — returns the user's DONE tasks
+     * (statusType === 'DONE' for the project). Used by mobile's
+     * "Done" filter to show completed work.
+     */
+    #[RequiresPermission(TicketsPermissions::VIEW)]
+    public function getAllDoneUserTickets(?int $userId = null, ?int $project = null): array
+    {
+        $tickets = $this->ticketRepository->simpleTicketQuery($userId, $project);
+
+        $ticketArray = [];
+        if (is_array($tickets)) {
+            $projectStatusLabels = [];
+
+            foreach ($tickets as $ticket) {
+                if ($ticket['type'] !== 'milestone') {
+                    if (! isset($projectStatusLabels[$ticket['projectId']])) {
+                        $projectStatusLabels[$ticket['projectId']] = $this->ticketRepository->getStateLabels($ticket['projectId']);
+                    }
+
+                    $statusConfig = $projectStatusLabels[$ticket['projectId']][$ticket['status']] ?? null;
+                    if ($statusConfig && ($statusConfig['statusType'] ?? '') === 'DONE') {
+                        $ticket['statusLabel'] = $statusConfig['name'];
+                        $ticket['statusClass'] = $statusConfig['class'] ?? '';
+                        $ticket['statusType'] = $statusConfig['statusType'] ?? '';
+                        $ticketArray[] = $ticket;
+                    }
+                }
+            }
+        }
+
+        return $ticketArray;
+    }
+
+    /**
+     * @api
+     *
+     * Returns the user's tasks that were marked DONE on a specific date
+     * (default today), each annotated with `dateClosed` (the completion
+     * timestamp). Powers the mobile "Done today" reflection — an accurate,
+     * complete mirror of what actually got finished, including unplanned work.
+     *
+     * "Closed on date" means the ticket is currently DONE *and* its status
+     * was changed to that DONE status on the given date (per zp_tickethistory).
+     * So a task finished on an earlier day is excluded, and a task reopened
+     * then re-completed the same day is included once. Built on the general
+     * getStatusChangeEvents primitive, so throughput/burndown and strategy
+     * reporting can reuse the same query.
+     *
+     * Thin wrapper over {@see getMyClosedTicketsForRange} with from == to.
+     */
+    #[RequiresPermission(TicketsPermissions::VIEW)]
+    public function getMyClosedTicketsForDate(?int $userId = null, ?string $date = null): array
+    {
+        $date = $date ?: dtHelper()->userNow()->format('Y-m-d');
+
+        return $this->getMyClosedTicketsForRange($userId, $date, $date);
+    }
+
+    /**
+     * @api
+     *
+     * Range form of {@see getMyClosedTicketsForDate}: the user's tasks marked
+     * DONE anywhere within [$from, $to] (inclusive, dates 'Y-m-d'), each
+     * annotated with `dateClosed` (the completion timestamp). Powers the mobile
+     * Progress "Closed this week / this month" sections — completed arcs are
+     * keyed on close-date within the period, independent of how recently the
+     * project was otherwise touched, so finished work never disappears.
+     *
+     * Same "closed" definition as the single-date form: the ticket is currently
+     * DONE and its status was changed to that DONE status within the range. A
+     * ticket completed more than once in the range is included once, keyed to
+     * its latest completion (events are newest-first).
+     *
+     * Bounds: an omitted $from or $to defaults to today; the range is then
+     * normalized so the earlier date is the lower bound (a reversed range is
+     * swapped rather than returning nothing). So passing only one bound yields
+     * the span between that date and today, in date order.
+     *
+     * A non-admin may only read their OWN closures: a caller-supplied $userId
+     * for someone else is forced back to the session user (IDOR guard).
+     */
+    #[RequiresPermission(TicketsPermissions::VIEW)]
+    public function getMyClosedTicketsForRange(?int $userId = null, ?string $from = null, ?string $to = null): array
+    {
+        $sessionUser = (int) session('userdata.id');
+        $userId = $userId ?: $sessionUser;
+        // IDOR guard: reading another user's closures requires admin.
+        if ($userId !== $sessionUser && ! Auth::userIsAtLeast(Roles::$admin)) {
+            $userId = $sessionUser;
+        }
+        if ($userId === 0) {
+            return [];
+        }
+
+        // Resolve "today" once (in the USER's calendar, not the server's) so a run
+        // across midnight can't disagree on bounds.
+        $today = dtHelper()->userNow()->format('Y-m-d');
+        $from = $from ?: $today;
+        $to = $to ?: $today;
+        // Tolerate a reversed range rather than returning nothing.
+        if ($from > $to) {
+            [$from, $to] = [$to, $from];
+        }
+
+        // Candidates: the user's currently-DONE tickets (statusType resolved).
+        $doneTickets = $this->getAllDoneUserTickets($userId);
+        if (empty($doneTickets)) {
+            return [];
+        }
+
+        $byId = [];
+        foreach ($doneTickets as $ticket) {
+            $byId[$ticket['id']] = $ticket;
+        }
+
+        $events = $this->ticketRepository->getStatusChangeEvents(array_keys($byId), $from, $to);
+
+        $closed = [];
+        foreach ($events as $event) {
+            $ticketId = (int) $event['ticketId'];
+            $ticket = $byId[$ticketId] ?? null;
+            if ($ticket === null || isset($closed[$ticketId])) {
+                continue;
+            }
+
+            // Only count changes INTO the ticket's current (DONE) status — it
+            // was actually marked done in the range, not merely touched. Events
+            // are newest-first, so the first match keeps the latest completion.
+            if ((string) $event['changeValue'] === (string) $ticket['status']) {
+                $ticket['dateClosed'] = $event['dateModified'];
+                $closed[$ticketId] = $ticket;
+            }
+        }
+
+        return array_values($closed);
+    }
+
+    /**
+     * @api
+     *
+     * Tickets the user COMMENTED on within [$from, $to] that they do NOT own
+     * (they're not the ticket's editor) — i.e. work they supported by weighing
+     * in on someone else's arc. Powers the mobile Progress "Supported" section
+     * (presence counts as much as production).
+     *
+     * Access safety: commented ticket ids are constrained to the PROJECTS the
+     * user can access (getProjectsUserHasAccessTo) — NOT to tickets they edit
+     * or collaborate on. Commenting on a ticket rarely makes you its editor or
+     * a collaborator, so scoping by those (as an earlier version did via
+     * simpleTicketQuery) silently dropped most supported work — it collapsed to
+     * "commented AND collaborator" and could return empty even when comments
+     * exist. Project access is the correct, still-safe boundary: a historical
+     * comment can't surface a ticket in a project the user no longer sees. The
+     * ownership filter then drops tickets the user is the editor of — those are
+     * "your work," not support. Defaults either bound to today.
+     *
+     * A non-admin may only read their OWN commented tickets: a caller-supplied
+     * $userId for someone else is forced back to the session user (IDOR guard,
+     * matching Projects::getProjectsUserHasAccessTo()).
+     *
+     * @return array<int, array<string, mixed>> Raw ticket rows (id, headline,
+     *                                          projectName, editorId, status, …).
+     *
+     * Note: these rows do NOT carry the resolved statusLabel / statusClass /
+     * statusType that the getAll*UserTickets methods attach.
+     */
+    #[RequiresPermission(TicketsPermissions::VIEW)]
+    public function getMyCommentedTicketsForRange(?int $userId = null, ?string $from = null, ?string $to = null): array
+    {
+        $sessionUser = (int) session('userdata.id');
+        $userId = $userId ?: $sessionUser;
+        // IDOR guard: reading someone else's comment activity requires admin.
+        if ($userId !== $sessionUser && ! Auth::userIsAtLeast(Roles::$admin)) {
+            $userId = $sessionUser;
+        }
+        if ($userId === 0) {
+            return [];
+        }
+        // Resolve "today" once (in the USER's calendar, not the server's) so a run
+        // across midnight can't disagree on bounds.
+        $today = dtHelper()->userNow()->format('Y-m-d');
+        $from = $from ?: $today;
+        $to = $to ?: $today;
+        if ($from > $to) {
+            [$from, $to] = [$to, $from];
+        }
+
+        $commentedIds = $this->ticketRepository->getTicketIdsCommentedByUser($userId, $from, $to);
+        if (empty($commentedIds)) {
+            return [];
+        }
+
+        // Scope to the projects the user can see — the correct access boundary
+        // for "tickets I commented on" (you comment on others' work without
+        // being its editor/collaborator, so filtering by those would drop it).
+        $projects = $this->projectService->getProjectsUserHasAccessTo($userId);
+        if (! is_array($projects) || empty($projects)) {
+            return [];
+        }
+        $projectIds = array_values(array_filter(array_map(
+            fn ($p) => (int) ($p['id'] ?? 0),
+            $projects
+        )));
+        if (empty($projectIds)) {
+            return [];
+        }
+
+        $tickets = $this->ticketRepository->getTicketsByIdsWithinProjects($commentedIds, $projectIds);
+
+        // "Supported", not "yours": drop tickets the user is the editor of.
+        $out = [];
+        foreach ($tickets as $ticket) {
+            if ((string) ($ticket['editorId'] ?? '') === (string) $userId) {
+                continue;
+            }
+            $out[] = $ticket;
+        }
+
+        return $out;
+    }
+
+    /**
+     * @api
+     *
+     * Companion to markTicketDone for un-completing. Resolves the
+     * project's first NEW-statusType status and patches to it. Used by
+     * mobile's "Done" filter — tap the checked checkbox to bring a task
+     * back into the active list.
+     */
+    #[RequiresPermission(TicketsPermissions::EDIT, entityScoped: true)]
+    public function markTicketReopen(int $id): bool
+    {
+        $ticket = $this->ticketRepository->getTicket($id);
+        if (! $ticket || empty($ticket->projectId)) {
+            return false;
+        }
+
+        $this->authorize(TicketsPermissions::EDIT, (int) $ticket->projectId);
+
+        $statusLabels = $this->ticketRepository->getStateLabels((int) $ticket->projectId);
+
+        $newStatusId = null;
+        foreach ($statusLabels as $statusId => $config) {
+            if (($config['statusType'] ?? '') === 'NEW') {
+                $newStatusId = (int) $statusId;
+                break;
+            }
+        }
+
+        if ($newStatusId === null) {
+            return false;
+        }
+
+        return $this->patch($id, ['status' => $newStatusId]);
+    }
+
+    /**
+     * Mark a ticket done by resolving the project's first DONE-statusType status and patching to
+     * it. Mobile's swipe-to-complete (the marquee gesture). Companion to {@see markTicketReopen}.
+     *
+     * Was unexposed (-32601) AND unauthorized — unlike its reopen companion it carried no @api,
+     * no #[RequiresPermission], and no in-body authorize (patch()'s dispatch attribute does not
+     * fire on this internal call). Now mirrors markTicketReopen exactly.
+     *
+     * @api
+     */
+    #[RequiresPermission(TicketsPermissions::EDIT, entityScoped: true)]
+    public function markTicketDone(int $id): bool
+    {
+        $ticket = $this->ticketRepository->getTicket($id);
+        if (! $ticket || empty($ticket->projectId)) {
+            return false;
+        }
+
+        $this->authorize(TicketsPermissions::EDIT, (int) $ticket->projectId);
+
+        $statusLabels = $this->ticketRepository->getStateLabels((int) $ticket->projectId);
+
+        $doneStatusId = null;
+        foreach ($statusLabels as $statusId => $config) {
+            if (($config['statusType'] ?? '') === 'DONE') {
+                $doneStatusId = (int) $statusId;
+                break;
+            }
+        }
+
+        if ($doneStatusId === null) {
+            return false;
+        }
+
+        return $this->patch($id, ['status' => $doneStatusId]);
+    }
+
+    /**
+     * Authorized JSON-RPC entry point for patching a single ticket field.
+     *
+     * Unlike the internal patch(), this enforces authorization because the
+     * JSON-RPC endpoint has no controller-level role gate: the caller must be an
+     * editor or above AND be assigned to the ticket's project (prevents
+     * cross-project IDOR via a smuggled ticket id).
+     *
+     * Field names the ticket does not have are never written. When NONE of the submitted fields
+     * can be applied the call fails with a ValidationException instead of reporting a silent
+     * no-op; with $strict any unknown field fails the call (#3704). Unknown fields are listed in
+     * the error data under `ignoredFields`.
+     *
+     * @param  int  $id  The ticket id to update
+     * @param  array  $values  The fields to update
+     * @param  bool  $strict  Reject the whole patch when any field is unknown (default false).
+     * @return bool True on success (false only if the underlying write fails)
+     *
+     * @throws AuthorizationException If the caller is not an editor, or is not assigned to the ticket's project
+     * @throws NotFoundException If the ticket does not exist
+     * @throws ValidationException If no field can be applied, or (strict) any field is unknown
+     *
+     * @api
+     */
+    #[RequiresPermission(TicketsPermissions::EDIT, entityScoped: true)]
+    public function patchTicket(int $id, array $values, bool $strict = false): bool
+    {
+        // getTicket() returns false when the user can't access the ticket's project.
+        $ticket = $this->getTicket($id);
+        if (! $ticket) {
+            throw new NotFoundException('The task you tried to edit could not be found.');
+        }
+
+        // Editor+ in the ticket's project (project-scoped role, not the session role) AND
+        // access to it. Replaces the prior session-scoped userIsAtLeast + assignment checks.
+        $this->authorize(TicketsPermissions::EDIT, (int) $ticket->projectId);
+
+        $ignoredFields = $this->getIgnoredPatchFields($values);
+        $nothingApplies = count($ignoredFields) === count($values);
+
+        if ($nothingApplies || ($strict && $ignoredFields !== [])) {
+            $message = $values === []
+                ? 'No fields to update were provided.'
+                : 'Unknown ticket field(s): '.implode(', ', $ignoredFields).'. Updatable fields include headline, description, status, type, priority, tags, editorId, projectId, milestoneid, dependingTicketId, sprint, storypoints, planHours, hourRemaining, dateToFinish, editFrom, editTo, acceptanceCriteria, collaborators.';
+
+            throw new ValidationException(['ignoredFields' => $ignoredFields], $message);
+        }
+
+        return $this->patch($id, $values);
+    }
+
+    /**
+     * The submitted patch fields that do not exist on a ticket and would be silently dropped.
+     *
+     * Not an @api method: MCP tools use it to tell the caller which fields were ignored (#3704).
+     *
+     * @param  array<string, mixed>  $values  The submitted field => value pairs.
+     * @return array<int, string> The ignored field names, in submission order.
+     */
+    public function getIgnoredPatchFields(array $values): array
+    {
+        // Consumed by patch() itself rather than written as columns.
+        $handledFields = ['collaborators', 'timetofinish', 'timefrom', 'timeto'];
+
+        $ignoredFields = [];
+        foreach (array_keys($values) as $field) {
+            $field = (string) $field;
+            if (in_array(strtolower($field), $handledFields, true) || TicketRepository::isPatchableField($field)) {
+                continue;
+            }
+
+            $ignoredFields[] = $field;
+        }
+
+        return $ignoredFields;
+    }
+
+    /**
+     * Set a ticket's status from a semantic status type ("new" / "inprogress" / "done").
+     *
+     * Used by the program cross-project kanban: columns are status types, but the value
+     * written is always a real status key that exists in the ticket's OWN project, so a
+     * drag on the program board can never leave the task with a status its project board
+     * doesn't recognize. Authorization (edit in the ticket's project) is delegated to
+     * patchTicket().
+     *
+     * @api
+     */
+    public function setTicketStatusByType(int $ticketId, string $statusType): bool
+    {
+        $ticket = $this->getTicket($ticketId);
+        if (! $ticket) {
+            throw new NotFoundException('The task you tried to edit could not be found.');
+        }
+
+        $targetStatus = $this->resolveProjectStatusKeyForType(
+            (int) $ticket->projectId,
+            $statusType,
+            $ticket->status === null ? null : (int) $ticket->status
+        );
+
+        if ($targetStatus === null) {
+            return false;
+        }
+
+        return $this->patchTicket($ticketId, ['status' => $targetStatus]);
+    }
+
+    /**
+     * Resolve a status key, valid in $projectId, for a desired semantic status type.
+     *
+     * Preserves the current status when it already belongs to the requested type, so a
+     * cross-project board move never collapses e.g. "Blocked" into plain "In Progress".
+     * Otherwise prefers the seed canonical key for the type, falling back to the lowest
+     * sortKey status of that type in the project.
+     */
+    private function resolveProjectStatusKeyForType(int $projectId, string $statusType, ?int $currentStatus = null): ?int
+    {
+        $statusType = strtoupper($statusType);
+        $labels = $this->ticketRepository->getStateLabels($projectId);
+
+        // Already the right type → keep the existing key (only the column changed visually).
+        if ($currentStatus !== null
+            && isset($labels[$currentStatus])
+            && ($labels[$currentStatus]['statusType'] ?? '') === $statusType) {
+            return $currentStatus;
+        }
+
+        // Prefer the seed canonical key for this type when present with the matching type.
+        $canonicalByType = ['NEW' => 3, 'INPROGRESS' => 4, 'DONE' => 0];
+        $canonical = $canonicalByType[$statusType] ?? null;
+        if ($canonical !== null
+            && isset($labels[$canonical])
+            && ($labels[$canonical]['statusType'] ?? '') === $statusType) {
+            return $canonical;
+        }
+
+        // Otherwise the lowest sortKey status of that type defined in the project.
+        $candidates = [];
+        foreach ($labels as $key => $status) {
+            if (($status['statusType'] ?? '') === $statusType) {
+                $candidates[$key] = $status['sortKey'] ?? PHP_INT_MAX;
+            }
+        }
+
+        if ($candidates === []) {
+            return null;
+        }
+
+        asort($candidates);
+
+        return (int) array_key_first($candidates);
+    }
+
+    /**
+     * Patch individual fields of a ticket.
+     *
+     * Self-authorizing: besides the @api wrappers (patchTicket, markTicketDone, ...) this is
+     * called directly by HTMX controllers, widgets and MCP tools, none of which pass through the
+     * #[RequiresPermission] dispatch gate. It therefore requires tickets.edit on the ticket's
+     * REAL project (project-scoped role + membership), and edit on the target project when the
+     * patch moves the ticket.
+     *
+     * @param  int|string  $id  The ticket id.
+     * @param  mixed  $params  Field => value pairs to update (any non-array is rejected).
+     * @return bool True on success, false when the ticket is not visible or the write fails.
+     *
+     * @throws AuthorizationException When the caller may not edit the ticket (or the target project).
+     * @throws ValidationException When the status is unknown or the new parent is missing, hidden or in another project.
+     */
     public function patch($id, $params): bool
     {
         if (! is_array($params)) {
@@ -2181,19 +3858,91 @@ class Tickets
             return false;
         }
 
+        $this->authorize(TicketsPermissions::EDIT, (int) $ticket->projectId);
+
+        // Read before the write so a status change can be told apart from a re-save.
+        $ticketBefore = $ticket;
+        $previousStatus = $ticket->status;
+        $previousProjectId = (int) $ticket->projectId;
+
+        // Reassigning a ticket to a different project requires edit rights in the TARGET project,
+        // not just the source (which the @api callers already authorized). Without this a user
+        // could move/inject a ticket into a project they have no access to.
+        if (isset($params['projectId']) && (int) $params['projectId'] !== (int) $ticket->projectId) {
+            $this->authorize(TicketsPermissions::EDIT, (int) $params['projectId']);
+        }
+
+        // A newly set parent must be a ticket the caller can see, like on create (#3702).
+        if (array_key_exists('dependingTicketId', $params) && (int) $params['dependingTicketId'] !== (int) $ticket->dependingTicketId) {
+            $this->assertParentTicketIsVisible($params['dependingTicketId'], (int) ($params['projectId'] ?? $ticket->projectId));
+        }
+
+        // On a move, links that belong to the old project (parent, milestone, sprint) are cleared
+        // unless the caller set them; explicitly set milestone/sprint must belong to the target.
+        if (isset($params['projectId'])) {
+            foreach ($this->clearForeignProjectLinksOnMove($ticket, (int) $params['projectId'], $params) as $field => $clearedValue) {
+                $params[$field] = $clearedValue;
+            }
+        }
+
+        // Moving without a status: map the current status to the target project's equivalent type.
+        $isMove = isset($params['projectId']) && (int) $params['projectId'] !== (int) $ticket->projectId;
+        if ($isMove && (! array_key_exists('status', $params) || $params['status'] === null || $params['status'] === '')) {
+            $params['status'] = $this->mapStatusToProject($ticket, (int) $params['projectId']);
+        }
+
+        // Resolve a status name/type to the project's status id; an empty status is dropped rather
+        // than written as '' (which the int column stores as 0 = Done) (#3702).
+        if (array_key_exists('status', $params)) {
+            $statusProjectId = (int) ($params['projectId'] ?? $ticket->projectId);
+            $params['status'] = $this->resolveStatusInput($params['status'], $statusProjectId);
+            if ($params['status'] === null) {
+                unset($params['status']);
+            }
+        }
+
+        // Handle collaborators separately since they live in the relationship table, not on zp_tickets
+        $collaboratorsUpdated = false;
+        if (array_key_exists('collaborators', $params)) {
+            $collaborators = is_array($params['collaborators']) ? $params['collaborators'] : [];
+            $this->ticketRepository->removeCollaborators($id);
+            $this->ticketRepository->addCollaborators($id, $collaborators, session('userdata.id'));
+            $collaboratorsUpdated = true;
+            unset($params['collaborators']);
+        }
+
         $params = $this->prepareTicketDates($params);
 
         $return = $this->ticketRepository->patchTicket($id, $params);
 
-        if (! $return) {
+        if (! $return && ! $collaboratorsUpdated) {
             return false;
         }
 
-        self::dispatchEvent('ticket_updated');
+        TicketUpdated::dispatch(ticketId: (int) $id, legacyHook: __FUNCTION__);
+
+        if ($return) {
+            $this->dispatchTicketChangeEvents((int) $id, $ticketBefore, $params);
+        }
 
         // Todo: create events and move notification logic to notification module
         if (isset($params['status'])) {
+            $this->dispatchTicketCompletedOnTransition(
+                (int) $id,
+                $previousStatus,
+                $previousProjectId,
+                $params['status'],
+                (int) ($params['projectId'] ?? $previousProjectId),
+                $ticketBefore
+            );
+
             $ticket = $this->getTicket($id);
+            if (! $ticket) {
+                return true;
+            }
+
+            $this->stopTimerWhenTicketIsDone((int) $id, $params['status'], (int) $ticket->projectId);
+
             $subject = sprintf($this->language->__('email_notifications.todo_update_subject'), $id, strip_tags($ticket->headline));
             $actual_link = BASE_URL.'/dashboard/home#/tickets/showTicket/'.$id;
             $message = sprintf($this->language->__('email_notifications.todo_update_message'), session('userdata.name'), strip_tags($ticket->headline));
@@ -2214,7 +3963,7 @@ class Tickets
             $this->projectService->notifyProjectUsers($notification);
         }
 
-        return (bool) $return;
+        return true;
     }
 
     /**
@@ -2224,6 +3973,7 @@ class Tickets
      *
      * @api
      */
+    #[RequiresPermission(TicketsPermissions::EDIT, entityScoped: true)]
     public function moveTicket(int $id, int $projectId): bool
     {
         $ticket = $this->getTicket($id);
@@ -2231,6 +3981,11 @@ class Tickets
         if (! $ticket) {
             return false;
         }
+
+        // Edit rights in BOTH the source project (above) and the TARGET project — otherwise a
+        // user with access to project A could inject tickets into project B they can't touch.
+        $this->authorize(TicketsPermissions::EDIT, (int) $ticket->projectId);
+        $this->authorize(TicketsPermissions::EDIT, $projectId);
 
         if ($ticket->type == 'milestone') {
             $milestoneTickets = $this->getAll(['milestone' => $ticket->id]);
@@ -2259,14 +4014,58 @@ class Tickets
      *
      * @api
      */
+    #[RequiresPermission(TicketsPermissions::EDIT, entityScoped: true)]
     public function quickUpdateMilestone($params): array|bool
     {
+        if ($params['headline'] == '') {
+            return ['status' => 'error', 'message' => 'Headline Missing'];
+        }
+
+        $milestoneId = (int) $params['id'];
+
+        // Load via the service so the project-assignment gate applies; a milestone
+        // in a project the user can't access returns false. (review)
+        $existingMilestone = $this->getTicket($milestoneId);
+
+        if (! $existingMilestone) {
+            return ['status' => 'error', 'message' => 'You are not allowed to edit this milestone.'];
+        }
+
+        $currentProjectId = (int) $existingMilestone->projectId;
+
+        // Editing a milestone is an edit op: require editor+ in the milestone's
+        // OWN project, evaluated project-scoped rather than against the session
+        // project's role. (review)
+        if (! $this->userIsAtLeastForProject(Roles::$editor, $currentProjectId)) {
+            return ['status' => 'error', 'message' => 'You are not allowed to edit this milestone.'];
+        }
+
+        // Honor the project chosen in the milestone dialog (#3294); the dialog
+        // posts projectId via a <select>. Fall back to the milestone's current
+        // project when callers (e.g. inline kanban edits) don't supply one.
+        $targetProjectId = (int) ($params['projectId'] ?? $currentProjectId);
+
+        if ($targetProjectId !== $currentProjectId) {
+            // The projectId is caller-supplied: require editor+ in the target
+            // project too, so a milestone can't be moved into a project where the
+            // user lacks edit rights. (#3294 review / IDOR)
+            if (! $this->userIsAtLeastForProject(Roles::$editor, $targetProjectId)) {
+                return ['status' => 'error', 'message' => 'You are not allowed to move this milestone to that project.'];
+            }
+
+            // Moving a milestone must take its tasks with it, otherwise they're
+            // left orphaned referencing a milestone in another project. moveTicket()
+            // already moves the milestone's children and the milestone row. (#3294 review)
+            if ($this->moveTicket($milestoneId, $targetProjectId) === false) {
+                return ['status' => 'error', 'message' => 'Could not move milestone to the new project.'];
+            }
+        }
 
         $values = [
             'headline' => $params['headline'],
             'type' => 'milestone',
             'description' => '',
-            'projectId' => session('currentProject'),
+            'projectId' => $targetProjectId,
             'editorId' => $params['editorId'],
             'userId' => session('userdata.id'),
             'date' => dtHelper()->userNow()->formatDateTimeForDb(),
@@ -2285,30 +4084,461 @@ class Tickets
             'editTo' => $params['editTo'] ?? '',
         ];
 
-        if ($values['headline'] == '') {
-            $error = ['status' => 'error', 'message' => 'Headline Missing'];
-
-            return $error;
+        // Callers without the field (e.g. inline kanban edits) must not wipe a saved outcome.
+        if (array_key_exists('outcomeImpact', $params)) {
+            $values['outcomeImpact'] = $params['outcomeImpact'];
         }
 
         $values = $this->prepareTicketDates($values);
 
-        self::dispatchEvent('milestone_updated');
-
         // $params is an array of field names. Exclude id
-        return $this->ticketRepository->updateTicket($values, $params['id']);
+        $updated = $this->ticketRepository->updateTicket($values, $milestoneId);
+
+        if ($updated) {
+            // Only after a successful write: the event means "fired after a milestone was updated".
+            MilestoneUpdated::dispatch(milestoneId: $milestoneId, projectId: $targetProjectId, legacyHook: __FUNCTION__);
+
+            $this->dispatchTicketCompletedOnTransition(
+                $milestoneId,
+                $existingMilestone->status,
+                $currentProjectId,
+                $values['status'],
+                $targetProjectId,
+                $existingMilestone
+            );
+        }
+
+        return $updated;
     }
 
     /**
+     * Loads a milestone (or any ticket) by id for the milestone dialog.
+     *
+     * Entity-scoped: the id is a ticket id, not a project id, so the attribute only marks
+     * coverage and the body authorizes tickets.view against the milestone's REAL project.
+     *
+     * @param  int  $id  The ticket/milestone id.
+     * @return TicketModel|bool The milestone model, or false if not found or not viewable.
+     *
      * @api
      */
-    public function upsertSubtask($values, $parentTicket): bool
+    #[RequiresPermission(TicketsPermissions::VIEW, entityScoped: true)]
+    public function getMilestone(int $id): TicketModel|bool
     {
+        $milestone = $this->ticketRepository->getTicket($id);
 
-        $subtaskId = $values['subtaskId'] ?? 'new';
+        // Verify the user may view the milestone's project (role + membership).
+        if ($milestone && ! empty($milestone->projectId) && $this->can(TicketsPermissions::VIEW, (int) $milestone->projectId)) {
+            return $milestone;
+        }
+
+        return false;
+    }
+
+    /**
+     * Builds a new (unsaved) milestone model with sensible defaults for the
+     * milestone dialog: status 3 ("New"), an edit window from today through
+     * one week from today.
+     *
+     * @return TicketModel The pre-populated milestone model.
+     */
+    public function getNewMilestone(): TicketModel
+    {
+        $milestone = app()->make(TicketModel::class);
+        $milestone->status = 3;
+
+        $today = dtHelper()->userNow();
+        $milestone->editFrom = $today->format('Y-m-d');
+        $milestone->editTo = $today->addWeek()->format('Y-m-d');
+
+        return $milestone;
+    }
+
+    /**
+     * Adds a comment to a milestone and fires the milestone comment
+     * notification to project users. Mirrors the legacy EditMilestone
+     * controller flow exactly (comment add + dedicated milestone comment
+     * notification on top of the generic comment notification).
+     *
+     * @param  array  $params  Request params containing 'id', 'text' and 'father'.
+     * @param  mixed  $milestone  The milestone entity the comment belongs to (TicketModel or false when not found).
+     * @return bool True if the comment was added, false otherwise.
+     *
+     * @api
+     */
+    #[RequiresPermission('comments.create', entityScoped: true)]
+    public function addMilestoneComment(array $params, mixed $milestone): bool
+    {
+        $milestoneId = (int) $params['id'];
 
         $values = [
-            'headline' => $values['headline'],
+            'text' => $params['text'],
+            'date' => date('Y-m-d H:i:s'),
+            'userId' => session('userdata.id'),
+            'moduleId' => $milestoneId,
+            'father' => $params['father'],
+        ];
+
+        $messageId = $this->commentService->addComment($values, 'ticket', $milestoneId, $milestone);
+
+        if (! $messageId) {
+            return false;
+        }
+
+        $values['id'] = $messageId;
+
+        $subject = $this->language->__('email_notifications.new_comment_milestone_subject');
+        $actualLink = BASE_URL.'#/tickets/editMilestone/'.$milestoneId;
+        $message = sprintf($this->language->__('email_notifications.new_comment_milestone_message'), session('userdata.name'));
+
+        $notification = app()->make(NotificationModel::class);
+        $notification->url = [
+            'url' => $actualLink,
+            'text' => $this->language->__('email_notifications.new_comment_milestone_cta'),
+        ];
+        $notification->entity = $values;
+        $notification->module = 'comments';
+        $notification->action = 'commented';
+        $notification->projectId = session('currentProject');
+        $notification->subject = $subject;
+        $notification->authorId = session('userdata.id');
+        $notification->message = $message;
+
+        $this->projectService->notifyProjectUsers($notification);
+
+        return true;
+    }
+
+    /**
+     * Updates a milestone from the milestone dialog and, on success, fires the
+     * milestone-updated notification to project users. Wraps
+     * quickUpdateMilestone() so existing non-dialog callers keep their current
+     * (notification-free) behavior.
+     *
+     * @param  array  $params  Milestone fields including 'id' and 'headline'.
+     * @return array|bool The quickUpdateMilestone result.
+     *
+     * @api
+     */
+    #[RequiresPermission(TicketsPermissions::EDIT, entityScoped: true)]
+    public function updateMilestoneFromDialog(array $params): array|bool
+    {
+        $result = $this->quickUpdateMilestone($params);
+
+        // Only a genuine success (true) should notify and report success.
+        // quickUpdateMilestone returns a truthy error array on its failure paths
+        // (headline missing, denied/failed project move); those must not be read
+        // as a successful edit. Return false so the caller surfaces the
+        // save-error notification instead of a false success. (review)
+        if ($result !== true) {
+            return false;
+        }
+
+        $subject = $this->language->__('email_notifications.milestone_update_subject');
+        $actualLink = BASE_URL.'#/tickets/editMilestone/'.(int) $params['id'];
+        $message = sprintf($this->language->__('email_notifications.milestone_update_message'), session('userdata.name'));
+
+        $notification = app()->make(NotificationModel::class);
+        $notification->url = [
+            'url' => $actualLink,
+            'text' => $this->language->__('email_notifications.milestone_update_cta'),
+        ];
+        $notification->entity = $params;
+        $notification->module = 'tickets';
+        $notification->action = 'updated';
+        $notification->projectId = session('currentProject');
+        $notification->subject = $subject;
+        $notification->authorId = session('userdata.id');
+        $notification->message = $message;
+
+        $this->projectService->notifyProjectUsers($notification);
+
+        return $result;
+    }
+
+    /**
+     * Creates a milestone from the milestone dialog and, on success, fires the
+     * milestone-created notification to project users. Wraps
+     * quickAddMilestone() so existing non-dialog callers keep their current
+     * (notification-free) behavior.
+     *
+     * @param  array  $params  Milestone fields including 'headline'.
+     * @return array|bool|int The new milestone id on success, otherwise the quickAddMilestone result.
+     *
+     * @api
+     */
+    #[RequiresPermission(TicketsPermissions::CREATE, entityScoped: true)]
+    public function createMilestoneFromDialog(array $params): array|bool|int
+    {
+        $result = $this->quickAddMilestone($params);
+
+        if (! is_numeric($result)) {
+            return $result;
+        }
+
+        $params['id'] = $result;
+
+        $subject = $this->language->__('email_notifications.milestone_created_subject');
+        $actualLink = BASE_URL.'#/tickets/editMilestone/'.$result;
+        $message = sprintf($this->language->__('email_notifications.milestone_created_message'), session('userdata.name'));
+
+        $notification = app()->make(NotificationModel::class);
+        $notification->url = [
+            'url' => $actualLink,
+            'text' => $this->language->__('email_notifications.milestone_created_cta'),
+        ];
+        $notification->entity = $params;
+        $notification->module = 'tickets';
+        $notification->action = 'created';
+        $notification->projectId = session('currentProject');
+        $notification->subject = $subject;
+        $notification->authorId = session('userdata.id');
+        $notification->message = $message;
+
+        $this->projectService->notifyProjectUsers($notification);
+
+        return $result;
+    }
+
+    /**
+     * Resolves a client's display name by id. Returns an empty string when no
+     * id is given or the client cannot be found.
+     *
+     * @param  int  $clientId  The client id (0 means "no client").
+     * @return string The client name, or an empty string.
+     *
+     * @api
+     */
+    #[RequiresPermission(TicketsPermissions::VIEW)]
+    public function getClientNameById(int $clientId): string
+    {
+        if ($clientId <= 0) {
+            return '';
+        }
+
+        $client = $this->clientService->get($clientId);
+
+        if (is_array($client) && count($client) > 0 && isset($client['name'])) {
+            return $client['name'];
+        }
+
+        return '';
+    }
+
+    /**
+     * Normalizes roadmap/milestone-table request params: defaults the type to
+     * "milestone" and, when tasks should be shown, clears the type and
+     * exclude-type filters so tasks are included alongside milestones.
+     *
+     * @param  array  $params  The incoming request params.
+     * @return array The normalized params.
+     */
+    public function normalizeRoadmapParams(array $params): array
+    {
+        if (isset($params['type']) === false) {
+            $params['type'] = 'milestone';
+        }
+
+        if (isset($params['showTasks']) === true) {
+            $params['type'] = '';
+            $params['excludeType'] = '';
+        }
+
+        return $params;
+    }
+
+    /**
+     * Builds the milestone-overview search criteria. Identical to
+     * prepareTicketSearchArray() but applies the overview-only business rule
+     * of defaulting the status filter to "not_done" when none is selected, to
+     * reduce load and keep the table readable.
+     *
+     * @param  array  $params  The incoming request params.
+     * @return array The search criteria with the overview status default applied.
+     */
+    public function getMilestonesOverviewSearchCriteria(array $params): array
+    {
+        $searchCriteria = $this->prepareTicketSearchArray($params);
+
+        if ($searchCriteria['status'] == '') {
+            $searchCriteria['status'] = 'not_done';
+        }
+
+        return $searchCriteria;
+    }
+
+    /**
+     * Handles the Kanban quick-add flow: maps the active swimlane context onto
+     * the new task (priority, story points, milestone, editor, sprint, type or
+     * a due-date bucket), creates the task, and manages the
+     * stay-open/error reopen flash state. Returns a normalized result so the
+     * controller only has to set the notification and redirect.
+     *
+     * @param  array  $formParams  Base quick-add fields (headline, status, milestone, sprint, projectId, editorId).
+     * @param  string|null  $swimlane  The swimlane value the task was added under.
+     * @param  string|null  $groupBy  The active Kanban grouping field.
+     * @param  bool  $stayOpen  Whether the quick-add form should stay open after a successful add.
+     * @return array{success: bool, headline: string, status: mixed, message: string} Normalized result for the controller.
+     *
+     * @api
+     */
+    #[RequiresPermission(TicketsPermissions::CREATE, entityScoped: true)]
+    public function quickAddTicketFromKanban(array $formParams, ?string $swimlane, ?string $groupBy, bool $stayOpen = false): array
+    {
+        if ($swimlane !== null && $swimlane !== '' && ! empty($groupBy)) {
+            // Map groupBy field to the parameter name expected by quickAddTicket()
+            $fieldMapping = [
+                'priority' => 'priority',
+                'storypoints' => 'storypoints',
+                'effort' => 'storypoints',
+                'milestoneid' => 'milestone',
+                'editorId' => 'editorId',
+                'sprint' => 'sprint',
+                'type' => 'type',
+            ];
+
+            if (isset($fieldMapping[$groupBy])) {
+                $formParams[$fieldMapping[$groupBy]] = $swimlane;
+            } elseif ($groupBy === 'dueDate') {
+                // Map due date bucket names to actual dates
+                $now = dtHelper()->userNow();
+                $dueDateMapping = [
+                    'overdue' => $now->formatDateForUser(),
+                    'due-this-week' => $now->endOfWeek(CarbonImmutable::FRIDAY)->formatDateForUser(),
+                    'due-next-week' => $now->addWeek()->endOfWeek(CarbonImmutable::FRIDAY)->formatDateForUser(),
+                    'due-later' => $now->addWeeks(2)->formatDateForUser(),
+                ];
+
+                if (isset($dueDateMapping[$swimlane])) {
+                    $formParams['dateToFinish'] = $dueDateMapping[$swimlane];
+                }
+            }
+        }
+
+        $result = $this->quickAddTicket($formParams);
+
+        if (is_array($result) && isset($result['status']) && $result['status'] === 'error') {
+            session()->flash('quickadd_reopen', [
+                'status' => $formParams['status'],
+                'swimlane' => $swimlane,
+                'headline' => $formParams['headline'],
+                'error' => $result['message'],
+            ]);
+
+            return [
+                'success' => false,
+                'headline' => $formParams['headline'],
+                'status' => $formParams['status'],
+                'message' => $result['message'],
+            ];
+        }
+
+        if ($stayOpen) {
+            session()->flash('quickadd_reopen', [
+                'status' => $formParams['status'],
+                'swimlane' => $swimlane,
+                'headline' => '',
+            ]);
+        }
+
+        return [
+            'success' => true,
+            'headline' => $formParams['headline'],
+            'status' => $formParams['status'],
+            'message' => '',
+        ];
+    }
+
+    /**
+     * Quick-add a task from the program (cross-project) kanban.
+     *
+     * The board columns are semantic status types, so the status is resolved to a real
+     * status key in the explicitly chosen child project (a task belongs to exactly one
+     * project). Authorization (create in that project) is enforced by quickAddTicket().
+     *
+     * @api
+     */
+    public function quickAddProgramTicket(array $formParams, ?string $swimlane, ?string $groupBy, bool $stayOpen, int $projectId, string $statusType): array
+    {
+        // Resolve the column's status type to a real key in the chosen project. May be null when
+        // the type can't be resolved — leave it null so quickAddTicket() applies its OWN safe
+        // project-NEW-status default (the single source of truth) rather than a hardcoded key.
+        $statusKey = $this->resolveProjectStatusKeyForType($projectId, $statusType)
+            ?? $this->resolveProjectStatusKeyForType($projectId, 'NEW');
+
+        $formParams['projectId'] = $projectId;
+        $formParams['status'] = $statusKey;
+
+        // groupBy 'project' has no per-ticket field to set (the project is the picker choice),
+        // so the swimlane value is ignored for it by quickAddTicketFromKanban's field mapping.
+        return $this->quickAddTicketFromKanban($formParams, $swimlane, $groupBy, $stayOpen);
+    }
+
+    /**
+     * Create a subtask under a parent ticket, or update one of the parent's existing subtasks.
+     *
+     * The parent is always reloaded server-side by id (a caller-supplied object/array is never
+     * trusted for its projectId), and authorization runs against the parent's REAL project:
+     * tickets.create for a new subtask, tickets.edit for an update. An update additionally
+     * requires that the target really is a subtask of that parent in the same project, so a
+     * caller cannot overwrite an arbitrary ticket by id or move it into another project.
+     *
+     * @param  mixed  $values  Subtask fields (headline, status, ...); `subtaskId` selects an update. Any non-array is rejected.
+     * @param  TicketModel|array|int|string|false|null  $parentTicket  The parent ticket (or its id).
+     * @return bool True on success, false when the parent/subtask cannot be resolved or the write fails.
+     *
+     * @throws AuthorizationException When the caller may not create/edit in the parent's project.
+     *
+     * @api
+     */
+    #[RequiresPermission(TicketsPermissions::CREATE, entityScoped: true)]
+    public function upsertSubtask($values, $parentTicket): bool
+    {
+        if (! is_array($values)) {
+            return false;
+        }
+
+        $parentTicketId = $this->resolveTicketId($parentTicket);
+        if ($parentTicketId === null) {
+            return false;
+        }
+
+        // Reload the parent so its project comes from the database, never from the caller.
+        $parentTicket = $this->ticketRepository->getTicket($parentTicketId);
+        if (! $parentTicket || empty($parentTicket->projectId)) {
+            return false;
+        }
+
+        $parentProjectId = (int) $parentTicket->projectId;
+
+        $subtaskId = $values['subtaskId'] ?? 'new';
+        $isNewSubtask = $subtaskId === 'new' || $subtaskId === '';
+        $existingSubtask = null;
+        $submittedValues = $values;
+
+        if ($isNewSubtask) {
+            $this->authorize(TicketsPermissions::CREATE, $parentProjectId);
+        } else {
+            $subtaskId = $this->resolveTicketId($subtaskId);
+            if ($subtaskId === null) {
+                return false;
+            }
+
+            $this->authorize(TicketsPermissions::EDIT, $parentProjectId);
+
+            // Only an existing subtask of THIS parent, in the parent's project, may be overwritten.
+            $existingSubtask = $this->ticketRepository->getTicket($subtaskId);
+            $isChildOfParent = $existingSubtask
+                && (int) $existingSubtask->dependingTicketId === $parentTicketId
+                && (int) $existingSubtask->projectId === $parentProjectId;
+
+            if (! $isChildOfParent) {
+                return false;
+            }
+        }
+
+        $values = [
+            'headline' => $values['headline'] ?? '',
             'type' => 'subtask',
             'description' => $values['description'] ?? '',
             'projectId' => $parentTicket->projectId,
@@ -2317,11 +4547,12 @@ class Tickets
             'date' => $this->dateTimeHelper->userNow()->formatDateTimeForDb(),
             'dateToFinish' => $values['dateToFinish'] ?? '',
             'priority' => $values['priority'] ?? 3,
-            'status' => $values['status'],
+            'status' => $this->resolveStatusInput($values['status'] ?? null, $parentProjectId, fallBackOnUnknownId: $isNewSubtask),
             'storypoints' => $values['storypoints'] ?? '',
             'hourRemaining' => $values['hourRemaining'] ?? 0,
             'planHours' => $values['planHours'] ?? 0,
-            'sprint' => '',
+            // A new subtask lives in its parent's sprint (#2078); updates keep the stored sprint.
+            'sprint' => $isNewSubtask ? ($parentTicket->sprint ?? '') : '',
             'acceptanceCriteria' => '',
             'tags' => '',
             'editFrom' => $values['editFrom'] ?? '',
@@ -2330,15 +4561,33 @@ class Tickets
             'milestoneid' => $parentTicket->milestoneid,
         ];
 
+        // An omitted/empty status keeps the stored one on update and is the project's NEW status
+        // on create (it used to be written as null/'' = Done) (#3702).
+        if ($values['status'] === null) {
+            unset($submittedValues['status']);
+            if ($isNewSubtask) {
+                $values['status'] = $this->defaultNewStatus($parentProjectId);
+            }
+        }
+
         $values = $this->prepareTicketDates($values);
 
-        if ($subtaskId == 'new' || $subtaskId == '') {
+        // Updating an existing subtask only changes the fields the caller sent (#3701). The
+        // parent link, project and subtask type are always set from the parent, never preserved.
+        if (! $isNewSubtask && $existingSubtask instanceof TicketModel) {
+            unset($submittedValues['sprint']);
+            $forcedFields = ['type' => true, 'projectId' => true, 'dependingTicketId' => true];
+            $values = $this->keepStoredValuesForOmittedFields($values, $submittedValues + $forcedFields, $existingSubtask);
+        }
+
+        if ($isNewSubtask) {
             // New Ticket
-            if (! $this->ticketRepository->addTicket($values)) {
+            $newSubtaskId = $this->ticketRepository->addTicket($values);
+            if (! $newSubtaskId) {
                 return false;
             }
 
-            self::dispatchEvent('ticket_created');
+            $this->dispatchTicketCreated($newSubtaskId, $values, 'subtask', __FUNCTION__);
 
         } else {
             // Update Ticket
@@ -2347,10 +4596,86 @@ class Tickets
                 return false;
             }
 
-            self::dispatchEvent('ticket_updated');
+            TicketUpdated::dispatch(ticketId: (int) $subtaskId, legacyHook: __FUNCTION__);
+
+            if ($existingSubtask instanceof TicketModel) {
+                $this->dispatchTicketChangeEvents((int) $subtaskId, $existingSubtask, $values);
+            }
+
+            if (array_key_exists('status', $submittedValues) && $existingSubtask instanceof TicketModel) {
+                $this->dispatchTicketCompletedOnTransition(
+                    (int) $subtaskId,
+                    $existingSubtask->status,
+                    $parentProjectId,
+                    $values['status'],
+                    $parentProjectId,
+                    $existingSubtask
+                );
+            }
         }
 
+        SubtasksUpdated::dispatch(parentTicketId: $parentTicketId);
+
         return true;
+    }
+
+    /**
+     * Resolve a caller-supplied ticket reference (model, array, or scalar id) to a positive int.
+     *
+     * Strict on purpose — the result keys authorization lookups, so arrays nested in params,
+     * non-numeric strings and non-positive values are rejected instead of being cast.
+     *
+     * @param  mixed  $ticket  A TicketModel, an array/object carrying `id`, or a scalar id.
+     * @return int|null The ticket id, or null when it does not name a ticket.
+     */
+    private function resolveTicketId(mixed $ticket): ?int
+    {
+        if ($ticket instanceof TicketModel) {
+            $ticket = $ticket->id;
+        } elseif (is_array($ticket)) {
+            $ticket = $ticket['id'] ?? null;
+        } elseif (is_object($ticket)) {
+            $ticket = $ticket->id ?? null;
+        }
+
+        if (! is_int($ticket) && ! is_string($ticket)) {
+            return null;
+        }
+
+        $id = filter_var($ticket, FILTER_VALIDATE_INT);
+
+        return ($id !== false && $id > 0) ? $id : null;
+    }
+
+    /**
+     * Authorized JSON-RPC entry point for Gantt re-sorting of tickets/milestones.
+     *
+     * Enforces editor+ and per-ticket project access (the RPC endpoint has no
+     * controller-level gate), then delegates to the internal updateTicketSorting().
+     *
+     * @param  array  $params  Array of ticketId => sortPosition from Gantt drag-drop
+     * @return bool True on success (false only if the underlying write fails)
+     *
+     * @throws AuthorizationException If the caller is not an editor, or is not assigned to a referenced task's project
+     * @throws NotFoundException If a referenced task does not exist
+     *
+     * @api
+     */
+    #[RequiresPermission(TicketsPermissions::EDIT, entityScoped: true)]
+    public function sortTickets(array $params): bool
+    {
+        // Authorize tickets.edit against EACH ticket's real project (the project-scoped role, not
+        // the session role), so a mixed batch cannot smuggle in tickets the caller may only view.
+        foreach (array_keys($params) as $ticketId) {
+            $ticket = $this->getTicket((int) $ticketId);
+            if (! $ticket) {
+                throw new NotFoundException('A task referenced in the sort order could not be found.');
+            }
+
+            $this->authorize(TicketsPermissions::EDIT, (int) $ticket->projectId);
+        }
+
+        return $this->updateTicketSorting($params);
     }
 
     /**
@@ -2365,7 +4690,7 @@ class Tickets
      * @param  array  $params  Array of ticketId => sortPosition from Gantt drag-drop
      * @return bool True on success, false on failure
      *
-     * @api
+     * @internal Authorize via sortTickets() for JSON-RPC callers; safe for internal service use.
      */
     public function updateTicketSorting($params): bool
     {
@@ -2447,19 +4772,88 @@ class Tickets
         $result = $this->ticketRepository->bulkUpdateSortIndex($allUpdates);
 
         if ($result) {
-            self::dispatchEvent('ticket_updated');
+            TicketUpdated::dispatch(legacyHook: __FUNCTION__);
         }
 
         return $result;
     }
 
     /**
+     * Applies a kanban drag: sets the status of the posted cards and their manual kanban order.
+     *
+     * @param  mixed  $params  statusKey => serialized card list ("ticket[]=1&ticket[]=2"); anything
+     *                         but an array (e.g. a malformed RPC call) is rejected.
+     * @param  string|null  $handler  The dragged card (ticket_ID); only it may change status.
+     * @param  bool  $preserveSortIndex  True when the board is sorted by a field rather than the
+     *                                   manual order: statuses change but kanbanSortIndex is kept.
+     *
      * @throws BindingResolutionException
      *
      * @api
      */
-    public function updateTicketStatusAndSorting($params, $handler = null): bool
+    #[RequiresPermission(TicketsPermissions::EDIT, entityScoped: true)]
+    public function updateTicketStatusAndSorting($params, $handler = null, bool $preserveSortIndex = false): bool
     {
+        if (! is_array($params)) {
+            return false;
+        }
+
+        // Collect all ticket IDs from the request to validate project access for each one.
+        // This prevents smuggling cross-project ticket IDs in a mixed batch.
+        $allTicketIds = [];
+
+        if ($handler) {
+            $allTicketIds[] = substr($handler, 7);
+        }
+
+        foreach ($params as $status => $ticketList) {
+            if (is_numeric($status) && ! empty($ticketList)) {
+                $tickets = explode('&', $ticketList);
+                foreach ($tickets as $ticketString) {
+                    $id = substr($ticketString, 9);
+                    if (! empty($id)) {
+                        $allTicketIds[] = $id;
+                    }
+                }
+            }
+        }
+
+        // Verify tickets.edit in the real project of every ticket in the batch (project-scoped
+        // role + membership via the permission engine — not the session role).
+        $checkedProjects = [];
+        // Statuses (and projects) before the write, so only real status changes can stop a timer
+        // or report a completion below.
+        $previousStatusByTicket = [];
+        $projectIdByTicket = [];
+        $ticketsBefore = [];
+        foreach ($allTicketIds as $ticketId) {
+            $ticket = $this->getTicket($ticketId);
+            if (! $ticket) {
+                return false;
+            }
+
+            $previousStatusByTicket[(int) $ticketId] = $ticket->status === null ? null : (string) $ticket->status;
+
+            $projectId = (int) $ticket->projectId;
+            $projectIdByTicket[(int) $ticketId] = $projectId;
+            $ticketsBefore[(int) $ticketId] = $ticket;
+            // Cache per-project decisions to avoid redundant lookups
+            if (! isset($checkedProjects[$projectId])) {
+                $checkedProjects[$projectId] = $this->can(TicketsPermissions::EDIT, $projectId);
+            }
+
+            if (! $checkedProjects[$projectId]) {
+                return false;
+            }
+        }
+
+        $newStatusByTicket = [];
+
+        // The kanban posts every card of the swimlane from the browser's (possibly stale) view.
+        // When the dragged card is known, only that card may change status; a card whose stored
+        // status differs was moved by someone else since this page loaded, so leave it alone
+        // instead of moving it back (#3099). RPC callers without a handler keep full control.
+        $draggedTicketId = $handler ? (int) substr($handler, 7) : null;
 
         // Jquery sortable serializes the array for kanban in format
         // statusKey: ticket[]=X&ticket[]=X2...,
@@ -2469,17 +4863,51 @@ class Tickets
             if (is_numeric($status) && ! empty($ticketList)) {
                 $tickets = explode('&', $ticketList);
 
-                if (is_array($tickets) === true) {
-                    foreach ($tickets as $key => $ticketString) {
-                        $id = substr($ticketString, 9);
+                foreach ($tickets as $key => $ticketString) {
+                    $id = substr($ticketString, 9);
 
-                        if ($this->ticketRepository->updateTicketStatus($id, $status, ($key * 100), $handler) === false) {
-                            return false;
+                    $previousStatus = $previousStatusByTicket[(int) $id] ?? null;
+                    $statusChanged = $previousStatus !== (string) $status;
+                    $isOtherCard = $draggedTicketId !== null && (int) $id !== $draggedTicketId;
+
+                    if ($isOtherCard) {
+                        // Only re-sort it, and only while its status is still the one we read: a
+                        // card moved meanwhile (stale tab, or an overlapping drag) is left alone.
+                        // With the board sorted by a field there is nothing to re-sort (#1536).
+                        if (! $statusChanged && ! $preserveSortIndex) {
+                            $this->ticketRepository->updateTicketStatus($id, $status, ($key * 100), $handler, $previousStatus);
                         }
+
+                        continue;
+                    }
+
+                    // A board sorted by a field (not manual order) shows cards in that order, so the
+                    // on-screen position must not overwrite the manual kanbanSortIndex (#1536).
+                    $kanbanSortIndex = $preserveSortIndex ? -1 : ($key * 100);
+
+                    if ($this->ticketRepository->updateTicketStatus($id, $status, $kanbanSortIndex, $handler) === false) {
+                        // Earlier tickets in the batch were already written (the repository
+                        // also reports false for "0 rows changed"), so their timers must still stop.
+                        $this->dispatchTicketCompletedForStatusChanges($newStatusByTicket, $previousStatusByTicket, $projectIdByTicket, $ticketsBefore);
+                        $this->stopTimerForTicketsMarkedDone($newStatusByTicket);
+
+                        return false;
+                    }
+
+                    // Every ticket of the swimlane is re-posted with its column's status; only
+                    // tickets whose status actually changed count, so a timer on a ticket that
+                    // was already Done is not stopped by dragging some other card.
+                    if ($statusChanged) {
+                        $newStatusByTicket[(int) $id] = $status;
                     }
                 }
             }
         }
+
+        // Any ticket in the batch may have changed status, not only the dragged one ($handler is
+        // optional for RPC callers). The user has at most one running timer, so look it up once.
+        $this->dispatchTicketCompletedForStatusChanges($newStatusByTicket, $previousStatusByTicket, $projectIdByTicket, $ticketsBefore);
+        $this->stopTimerForTicketsMarkedDone($newStatusByTicket);
 
         if ($handler) {
             // Assumes format ticket_ID
@@ -2509,7 +4937,7 @@ class Tickets
             }
         }
 
-        self::dispatchEvent('ticket_updated');
+        TicketUpdated::dispatch(ticketId: $draggedTicketId ?: null, legacyHook: __FUNCTION__);
 
         return true;
     }
@@ -2522,18 +4950,36 @@ class Tickets
      *
      * @api
      */
+    #[RequiresPermission(TicketsPermissions::DELETE, entityScoped: true)]
     public function delete($id): array|bool
     {
 
         $ticket = $this->getTicket($id);
 
-        if (! $ticket || ! $this->projectService->isUserAssignedToProject(session('userdata.id'), $ticket->projectId)) {
+        if (! $ticket) {
             return ['msg' => 'notifications.ticket_delete_error', 'type' => 'error'];
         }
 
+        // Milestones carry goal tracked_by edges (and child-ticket links) that
+        // only deleteMilestone() cascades — deleting one through the generic
+        // path would strand orphaned edges. Route by actual type, not by which
+        // entry point the caller happened to use.
+        if (($ticket->type ?? '') === 'milestone') {
+            return $this->deleteMilestone($id);
+        }
+
+        // Editor+ in the ticket's project AND access to it (was access-only, no role gate).
+        $this->authorize(TicketsPermissions::DELETE, (int) $ticket->projectId);
+
+        // Collaborator relationship rows are cleaned up inside the repository's delticket().
         if ($this->ticketRepository->delticket($id)) {
 
-            self::dispatchEvent('ticket_deleted');
+            TicketDeleted::dispatch(ticketId: (int) $id, legacyHook: __FUNCTION__);
+
+            // The parent's subtask list selects children by dependingTicketId, whatever their type.
+            if ((int) ($ticket->dependingTicketId ?? 0) > 0) {
+                SubtasksUpdated::dispatch(parentTicketId: (int) $ticket->dependingTicketId);
+            }
 
             return true;
         }
@@ -2567,22 +5013,26 @@ class Tickets
      *
      * @api
      */
+    #[RequiresPermission(TicketsPermissions::DELETE, entityScoped: true)]
     public function deleteMilestone($id): array|bool
     {
 
         $ticket = $this->getTicket($id);
 
-        if (! $this->projectService->isUserAssignedToProject(session('userdata.id'), $ticket->projectId)) {
+        if (! $ticket) {
             return ['msg' => 'notifications.milestone_delete_error', 'type' => 'error'];
         }
 
-        if ($this->ticketRepository->delMilestone($id)) {
-            self::dispatchEvent('milestone_deleted');
+        // Editor+ in the milestone's project AND access to it (was access-only, no role gate).
+        $this->authorize(TicketsPermissions::DELETE, (int) $ticket->projectId);
 
-            return true;
-        }
+        $this->ticketRepository->delMilestone($id);
+        // Drop this milestone's tracked_by links from any goals. (Refine: move
+        // to a MilestoneDeleted listener per the event-driven pattern.)
+        $this->goalcanvasService->detachMilestoneFromGoals((int) $id);
+        MilestoneDeleted::dispatch(milestoneId: (int) $id, legacyHook: __FUNCTION__);
 
-        return false;
+        return true;
     }
 
     /**
@@ -2590,6 +5040,7 @@ class Tickets
      *
      * @api
      */
+    #[RequiresPermission(TicketsPermissions::VIEW)]
     public function getLastTicketViewUrl(): mixed
     {
 
@@ -2641,6 +5092,7 @@ class Tickets
     /**
      * @api
      */
+    #[RequiresPermission(TicketsPermissions::VIEW)]
     public function getGroupByFieldOptions(): array
     {
         // Alphabetically ordered (except "No Grouping" stays first as default)
@@ -2684,6 +5136,12 @@ class Tickets
                 'class' => '',
                 'function' => 'getPriorityLabels',
             ],
+            'project' => [
+                'id' => 'project',
+                'field' => 'projectId',
+                'label' => 'project',
+                'class' => '',
+            ],
             'sprint' => [
                 'id' => 'sprint',
                 'field' => 'sprint',
@@ -2719,6 +5177,7 @@ class Tickets
      *
      * @api
      */
+    #[RequiresPermission(TicketsPermissions::VIEW)]
     public function getSortByFieldOptions(): array
     {
         return [
@@ -2782,6 +5241,7 @@ class Tickets
      *
      * @api
      */
+    #[RequiresPermission(TicketsPermissions::VIEW)]
     public function getNewFieldOptions(): array
     {
         if (! defined('BASE_URL')) {
@@ -2803,15 +5263,95 @@ class Tickets
     }
 
     /**
-     * @throws BindingResolutionException
+     * Compute at-a-glance board metrics (total, unassigned, due-this-week, last
+     * updated) from an already-fetched grouped ticket set. Working off the rows
+     * the board just rendered means the counts reflect the current filters and
+     * cost no extra query.
+     *
+     * @param  array  $groupedTickets  Grouped tickets as returned by getAllGrouped()
+     *                                 (each group holds its rows under 'items').
+     *
+     * @internal Board-header helper only; deliberately NOT @api, so it is not
+     *           reachable via JSON-RPC (which would let a caller submit an
+     *           arbitrarily large groupedTickets payload).
      */
-    public function getTicketTemplateAssignments($params): array
+    public function getBoardSummary(array $groupedTickets): BoardSummary
+    {
+        $summary = new BoardSummary;
+
+        // Resolve the datetime helper once — it's used per ticket (twice) below,
+        // and dtHelper() resolves through the container, so caching it avoids
+        // avoidable overhead on large boards.
+        $dt = dtHelper();
+
+        // "This week" = today through the end of the current week, compared as
+        // calendar dates in the user's timezone (Y-m-d string compare is
+        // chronological) so a date-only due date lands in the intended week.
+        $userNow = $dt->userNow();
+        $weekStartDate = $userNow->format('Y-m-d');
+        $weekEndDate = $userNow->endOfWeek()->format('Y-m-d');
+
+        // Parse a DB date to CarbonImmutable, or null if it's unusable.
+        // isValidDateString() cheaply filters the common sentinels (empty,
+        // 0000-00-00, 1969-12-31); the try/catch then catches a genuinely
+        // malformed-but-non-sentinel value so one bad row can't throw and blank
+        // the whole board header.
+        $safeParse = static function (mixed $value) use ($dt): ?CarbonImmutable {
+            if (! $dt->isValidDateString($value !== null ? (string) $value : null)) {
+                return null;
+            }
+            try {
+                return $dt->parseDbDateTime((string) $value);
+            } catch (\Exception $e) {
+                return null;
+            }
+        };
+
+        foreach ($groupedTickets as $group) {
+            foreach ($group['items'] ?? [] as $ticket) {
+                $summary->total++;
+
+                $editorId = is_object($ticket) ? ($ticket->editorId ?? null) : ($ticket['editorId'] ?? null);
+                if (empty($editorId)) {
+                    $summary->unassigned++;
+                }
+
+                $due = is_object($ticket) ? ($ticket->dateToFinish ?? null) : ($ticket['dateToFinish'] ?? null);
+                $dueDt = $safeParse($due);
+                if ($dueDt !== null) {
+                    $dueDate = $dueDt->setToUserTimezone()->format('Y-m-d');
+                    if ($dueDate >= $weekStartDate && $dueDate <= $weekEndDate) {
+                        $summary->dueThisWeek++;
+                    }
+                }
+
+                $modified = is_object($ticket) ? ($ticket->modified ?? null) : ($ticket['modified'] ?? null);
+                $modifiedDt = $safeParse($modified);
+                if ($modifiedDt !== null) {
+                    if ($summary->lastUpdated === null || $modifiedDt->greaterThan($summary->lastUpdated)) {
+                        $summary->lastUpdated = $modifiedDt;
+                    }
+                }
+            }
+        }
+
+        return $summary;
+    }
+
+    /**
+     * Builds the shared template variables for the project to-do views (kanban, table, list, …).
+     *
+     * @param  array  $params  Incoming request/search parameters.
+     * @param  string  $kanbanSort  Card order (a KanbanViewSettings::SORT_OPTIONS key); defaults to
+     *                              the manual kanban order. Unknown values fall back to manual.
+     */
+    public function getTicketTemplateAssignments($params, string $kanbanSort = KanbanViewSettings::DEFAULT_SORT): array
     {
 
         $currentSprint = $this->sprintService->getCurrentSprintId((int) session('currentProject'));
 
         $searchCriteria = $this->prepareTicketSearchArray($params);
-        $searchCriteria['orderBy'] = 'kanbansort';
+        $searchCriteria['orderBy'] = KanbanViewSettings::repositorySortKey($kanbanSort);
 
         $allTickets = $this->getAllGrouped($searchCriteria);
         $allTicketStates = $this->getStatusLabels();
@@ -2832,7 +5372,7 @@ class Tickets
         $sprints = $this->sprintService->getAllSprints(session('currentProject'));
         $futureSprints = $this->sprintService->getAllFutureSprints((int) session('currentProject'));
 
-        $users = $this->projectService->getUsersAssignedToProject(session('currentProject'));
+        $users = $this->projectService->getUsersWithAccessToProject((int) session('currentProject'));
 
         $milestones = $this->getAllMilestones([
             'sprint' => '',
@@ -2850,12 +5390,13 @@ class Tickets
         }
 
         $allTickets = $this->enrichGroupedTicketsWithCollaborators($allTickets);
-        $allTickets = self::dispatchFilter('filterTickets', $allTickets);
+        $allTickets = TicketListFilter::dispatch(tickets: $allTickets, legacyHook: __FUNCTION__);
 
         return [
             'currentSprint' => session('currentSprint'),
             'searchCriteria' => $searchCriteria,
             'allTickets' => $allTickets,
+            'boardSummary' => $this->getBoardSummary($allTickets),
             'allTicketStates' => $allTicketStates,
             'efforts' => $efforts,
             'priorities' => $priorities,
@@ -2875,6 +5416,200 @@ class Tickets
     }
 
     /**
+     * Build the template assignments for a program-level cross-project task board.
+     *
+     * Mirrors getTicketTemplateAssignments() but scopes the ticket query to a set of
+     * child project ids (instead of the single session project), aggregates the
+     * supporting datasets (users, milestones) across those projects, and surfaces the
+     * data a cross-project board needs: per-project status labels (so a task is always
+     * rendered/edited with statuses that exist in ITS OWN project) and the semantic
+     * status-type columns used by the program kanban.
+     *
+     * @param  array  $params  Incoming request/search parameters.
+     * @param  int  $programId  The program project id (owns the shared sprints + canonical labels).
+     * @param  int[]  $childIds  The child project ids the board spans. Re-checked here: ids the
+     *                           caller may not view are dropped (this is an @api entry point).
+     * @param  array<int, string>  $availableProjects  id => name map used by the project filter/grouping.
+     *
+     * @throws AuthorizationException When the caller may not view the program itself.
+     *
+     * @api
+     */
+    #[RequiresPermission(TicketsPermissions::VIEW, entityScoped: true)]
+    public function getProgramTicketTemplateAssignments(array $params, int $programId, array $childIds, array $availableProjects): array
+    {
+        $this->authorize(TicketsPermissions::VIEW, $programId);
+
+        // Never trust the child list: keep only real ids the caller can view, so the board's
+        // tickets, milestones and user rosters cannot be pulled from arbitrary projects.
+        $childIds = array_values(array_unique(array_filter(
+            array_map('intval', array_filter($childIds, 'is_scalar')),
+            fn (int $id) => $id > 0 && $this->can(TicketsPermissions::VIEW, $id)
+        )));
+
+        $searchCriteria = $this->prepareTicketSearchArray($params);
+        // Neutralize the single-project filter (currentProject is the program, which owns no
+        // tickets); the board is scoped to the child projects via `projects` instead.
+        $searchCriteria['currentProject'] = '';
+        $searchCriteria['orderBy'] = 'kanbansort';
+
+        // The sidebar "Project" filter narrows the board, but only ever WITHIN the authorized
+        // child set — request-supplied project ids are never trusted on their own. When no
+        // project is picked, the board spans every authorized child.
+        $requestedProjects = array_values(array_filter(
+            array_map('intval', explode(',', (string) ($searchCriteria['projects'] ?? ''))),
+            static fn ($id) => $id > 0
+        ));
+        $effectiveProjectIds = $requestedProjects !== []
+            ? array_values(array_intersect($requestedProjects, $childIds))
+            : $childIds;
+
+        // Query with the effective (intersected) set; keep $searchCriteria['projects'] as the
+        // requested value so the filter UI + tab links reflect the user's selection.
+        $queryCriteria = $searchCriteria;
+        $queryCriteria['projects'] = implode(',', $effectiveProjectIds);
+
+        $allTickets = $effectiveProjectIds === []
+            ? ['all' => ['label' => 'all', 'id' => 'all', 'value' => '', 'class' => '', 'items' => []]]
+            : $this->getAllGrouped($queryCriteria);
+
+        // Per-project status labels: a task must be displayed and editable with statuses that
+        // actually exist in its own project, never the program's, so a status change can never
+        // orphan it off the project board.
+        $statusLabelsByProject = [];
+        foreach ($childIds as $pid) {
+            $statusLabelsByProject[$pid] = $this->ticketRepository->getStateLabels($pid);
+        }
+
+        // Annotate each ticket with the semantic status type resolved from its own project,
+        // used for cross-project kanban column placement and status grouping.
+        $allTickets = $this->annotateTicketsWithStatusType($allTickets, $statusLabelsByProject);
+
+        $efforts = $this->getEffortLabels();
+        $priorities = $this->getPriorityLabels();
+        $types = $this->getTicketTypes();
+        $types[] = 'milestone';
+        $ticketTypeIcons = $this->getTypeIcons();
+
+        $numOfFilters = $this->countSetFilters($searchCriteria);
+        $onTheClock = $this->timesheetService->isClocked(session('userdata.id'));
+
+        // Sprints are owned by the program and shared across child projects.
+        $sprints = $this->sprintService->getAllSprints($programId);
+        $futureSprints = $this->sprintService->getAllFutureSprints($programId);
+
+        // Aggregate assignable users + milestones across the child projects (deduped).
+        $users = [];
+        $milestones = [];
+        if ($childIds !== []) {
+            // Milestones: a single query across all child projects via the multi-project filter,
+            // rather than one (heavy, joined) query per project.
+            foreach ($this->getAllMilestones(['sprint' => '', 'type' => 'milestone', 'projects' => implode(',', $childIds)]) as $milestone) {
+                $milestones[$milestone->id] = $milestone;
+            }
+
+            // Users: one light indexed lookup per child project (bounded by child count).
+            // getUsersWithAccessToProject applies each project's psettings/client access
+            // rules, so we keep the per-project call and dedupe by id.
+            foreach ($childIds as $pid) {
+                foreach ($this->projectService->getUsersWithAccessToProject((int) $pid) as $user) {
+                    $users[$user['id']] = $user;
+                }
+            }
+        }
+        $users = array_values($users);
+        $milestones = array_values($milestones);
+
+        $groupByOptions = $this->getGroupByFieldOptions();
+        $newField = $this->getNewFieldOptions();
+        $sortOptions = $this->getSortByFieldOptions();
+
+        $searchUrlString = '';
+        if ($numOfFilters > 0 || $searchCriteria['groupBy'] != '') {
+            $searchUrlString = '?'.http_build_query($this->getSetFilters($searchCriteria, true));
+        }
+
+        $allTickets = $this->enrichGroupedTicketsWithCollaborators($allTickets);
+        $allTickets = TicketListFilter::dispatch(tickets: $allTickets, legacyHook: __FUNCTION__);
+
+        $statusTypeColumns = $this->getStatusTypeColumns();
+
+        return [
+            'currentSprint' => session('currentSprint'),
+            'searchCriteria' => $searchCriteria,
+            'allTickets' => $allTickets,
+            // For table/list the program's own labels are a sensible fallback; per-row status
+            // rendering uses statusLabelsByProject. For the kanban the controller assigns
+            // statusTypeColumns as allKanbanColumns.
+            'allTicketStates' => $this->ticketRepository->getStateLabels($programId),
+            'statusLabelsByProject' => $statusLabelsByProject,
+            'statusTypeColumns' => $statusTypeColumns,
+            'efforts' => $efforts,
+            'priorities' => $priorities,
+            'types' => $types,
+            'ticketTypeIcons' => $ticketTypeIcons,
+            'numOfFilters' => $numOfFilters,
+            'onTheClock' => $onTheClock,
+            'sprints' => $sprints,
+            'futureSprints' => $futureSprints,
+            'users' => $users,
+            'milestones' => $milestones,
+            'groupByOptions' => $groupByOptions,
+            'newField' => $newField,
+            'sortOptions' => $sortOptions,
+            'searchParams' => $searchUrlString,
+            'availableProjects' => $availableProjects,
+            'programBoard' => true,
+        ];
+    }
+
+    /**
+     * The semantic status-type columns used by a cross-project (program) kanban board.
+     * Keyed by the lowercased status type so tickets can be placed by their computed
+     * statusType and the board CSS classes stay consistent (status_new, etc.).
+     *
+     * @return array<string, array<string, mixed>>
+     */
+    private function getStatusTypeColumns(): array
+    {
+        return [
+            'new' => ['name' => $this->language->__('status.new'), 'class' => 'label-info', 'statusType' => 'NEW', 'kanbanCol' => true, 'sortKey' => 1],
+            'inprogress' => ['name' => $this->language->__('status.in_progress'), 'class' => 'label-warning', 'statusType' => 'INPROGRESS', 'kanbanCol' => true, 'sortKey' => 2],
+            'done' => ['name' => $this->language->__('status.done'), 'class' => 'label-success', 'statusType' => 'DONE', 'kanbanCol' => true, 'sortKey' => 3],
+        ];
+    }
+
+    /**
+     * Annotate each ticket in a grouped collection with the lowercased semantic status type
+     * resolved from its own project's labels. Used to place cross-project tickets into the
+     * shared status-type columns / groups without losing each project's real status key.
+     *
+     * @param  array<string, array<string, mixed>>  $groupedTickets
+     * @param  array<int, array>  $statusLabelsByProject
+     * @return array<string, array<string, mixed>>
+     */
+    private function annotateTicketsWithStatusType(array $groupedTickets, array $statusLabelsByProject): array
+    {
+        foreach ($groupedTickets as $groupKey => $group) {
+            if (! isset($group['items']) || ! is_array($group['items'])) {
+                continue;
+            }
+
+            foreach ($group['items'] as $index => $ticket) {
+                $projectId = (int) ($ticket['projectId'] ?? 0);
+                $statusKey = $ticket['status'] ?? null;
+                $labels = $statusLabelsByProject[$projectId] ?? [];
+                // A ticket can carry a status key no longer defined in its project; isset() keeps
+                // the nested lookup warning-free and falls back to NEW.
+                $type = isset($labels[$statusKey]['statusType']) ? $labels[$statusKey]['statusType'] : 'NEW';
+                $groupedTickets[$groupKey]['items'][$index]['statusType'] = strtolower($type);
+            }
+        }
+
+        return $groupedTickets;
+    }
+
+    /**
      * Adds collaborator display metadata to grouped ticket collections used by list/kanban views.
      *
      * @param  array<string, array<string, mixed>>  $groupedTickets
@@ -2885,7 +5620,9 @@ class Tickets
         $ticketIds = [];
 
         foreach ($groupedTickets as $group) {
-            foreach (($group['items'] ?? []) as $ticket) {
+            // Support both 'items' (list/kanban views) and 'tickets' (ToDoWidget views)
+            $items = $group['items'] ?? $group['tickets'] ?? [];
+            foreach ($items as $ticket) {
                 if (isset($ticket['id'])) {
                     $ticketIds[] = (int) $ticket['id'];
                 }
@@ -2899,11 +5636,16 @@ class Tickets
         $collaboratorsByTicket = $this->ticketRepository->getCollaboratorsByTicketIds($ticketIds);
 
         foreach ($groupedTickets as &$group) {
-            if (! isset($group['items']) || ! is_array($group['items'])) {
+            // Determine which key holds the ticket array
+            if (isset($group['items']) && is_array($group['items'])) {
+                $key = 'items';
+            } elseif (isset($group['tickets']) && is_array($group['tickets'])) {
+                $key = 'tickets';
+            } else {
                 continue;
             }
 
-            foreach ($group['items'] as &$ticket) {
+            foreach ($group[$key] as &$ticket) {
                 $ticketId = (int) ($ticket['id'] ?? 0);
                 $editorId = (int) ($ticket['editorId'] ?? 0);
                 $collaboratorIds = $collaboratorsByTicket[$ticketId] ?? [];
@@ -2973,6 +5715,8 @@ class Tickets
             $groupBy = 'time';
         }
 
+        $tickets = [];
+
         if ($groupBy === 'time') {
             $tickets = $this->getOpenUserTicketsThisWeekAndLater(userId: session('userdata.id'), projectId: $projectFilter, includeMilestones: true);
         } elseif ($groupBy === 'project') {
@@ -3000,7 +5744,8 @@ class Tickets
             }
         }
 
-        $tickets = self::dispatch_filter('myTodoWidgetTasks', $tickets);
+        $tickets = $this->enrichGroupedTicketsWithCollaborators($tickets);
+        $tickets = TodoWidgetTasksFilter::dispatch(tickets: $tickets, legacyHook: __FUNCTION__);
 
         return [
             'tickets' => $tickets,
@@ -3100,14 +5845,28 @@ class Tickets
                         $milestoneId = $ticket['milestoneid'];
 
                         if (! isset($milestoneCache[$milestoneId])) {
-                            $milestoneCache[$milestoneId] = (array) $this->getTicket($milestoneId);
+                            // getTicket() returns false when the user can't access the milestone's
+                            // project (e.g. a cross-project milestone linked to a goal). Casting false
+                            // to an array injects an empty "ticket" that later 500s the widget render,
+                            // so cache null and skip it instead.
+                            $milestone = $this->getTicket($milestoneId);
+                            $milestoneRow = $milestone ? (array) $milestone : null;
+                            if ($milestoneRow !== null) {
+                                // Same canonical overdue rule as the task rows (#3863).
+                                $milestoneRow['isOverdue'] = $this->getGroupKeyForTicket($milestoneRow, 'time') === 'overdue';
+                            }
+                            $milestoneCache[$milestoneId] = $milestoneRow;
                         }
-                        $ticketGroup['tickets'][] = $milestoneCache[$milestoneId];
-                        $milestoneIds[$ticketGroup['groupValue']][] = $milestoneId;
+
+                        if ($milestoneCache[$milestoneId] !== null) {
+                            $ticketGroup['tickets'][] = $milestoneCache[$milestoneId];
+                            $milestoneIds[$ticketGroup['groupValue']][] = $milestoneId;
+                        }
                     }
                 }
             }
         }
+        unset($ticketGroup);
 
         // Fetch the milestone data for all collected milestone IDs
         //            if (! empty($milestoneIds)) {
@@ -3134,12 +5893,25 @@ class Tickets
         //                }
         //            }
 
+        // Enrich while tickets are still flat — buildTicketHierarchy() nests subtasks into
+        // 'children', so enriching afterwards would only reach the root rows.
+        $tickets = $this->enrichGroupedTicketsWithCollaborators($tickets);
+
+        // The cards check each ticket's project for the Timesheets module (timer button): load
+        // the module switches of every project shown in one read, subtasks included.
+        $projectIdsShown = [];
+        foreach ($tickets as $shownGroup) {
+            $projectIdsShown = [...$projectIdsShown, ...array_column($shownGroup['tickets'] ?? [], 'projectId')];
+        }
+        $this->projectModules->preload($projectIdsShown);
+
         // Process tickets to build hierarchical structure
         foreach ($tickets as $groupKey => &$ticketGroup) {
             if (isset($ticketGroup['tickets']) && is_array($ticketGroup['tickets'])) {
                 $ticketGroup['tickets'] = $this->buildTicketHierarchy($ticketGroup['tickets'], $sortingArray);
             }
         }
+        unset($ticketGroup);
 
         $onTheClock = $this->timesheetService->isClocked(session('userdata.id'));
         $effortLabels = $this->getEffortLabels();
@@ -3157,8 +5929,10 @@ class Tickets
                 }
             }
         }
+        unset($ticketGroup);
 
-        $tickets = self::dispatch_filter('myTodoWidgetTasks', $tickets);
+        // Collaborators were enriched above, before the hierarchy was built.
+        $tickets = TodoWidgetTasksFilter::dispatch(tickets: $tickets, hierarchical: true, legacyHook: __FUNCTION__);
 
         return [
             'tickets' => $tickets,
@@ -3193,6 +5967,11 @@ class Tickets
                 continue;
             }
 
+            // Always the canonical due-date rule (#3863), regardless of the widget's
+            // current $groupBy — a ticket grouped by project/priority must still be
+            // able to show an overdue signal in the due-date cell.
+            $row['isOverdue'] = $this->getGroupKeyForTicket($row, 'time') === 'overdue';
+
             $groupKey = $this->getGroupKeyForTicket($row, $groupBy);
             $groupLabel = $this->getGroupLabelForTicket($row, $groupBy, $groupKey);
 
@@ -3210,7 +5989,7 @@ class Tickets
 
         // Sort groups by their order
         uasort($tickets, function ($a, $b) {
-            return ($a['order'] ?? 999) <=> ($b['order'] ?? 999);
+            return $a['order'] <=> $b['order'];
         });
 
         return $tickets;
@@ -3481,8 +6260,6 @@ class Tickets
      *
      * @param  array  $values  The values of the ticket fields.
      * @return array The values of the ticket fields after preparing the dates.
-     *
-     * @api
      */
     public function prepareTicketDates(&$values)
     {
@@ -3492,6 +6269,30 @@ class Tickets
             try {
                 if ($values['dateToFinish'] instanceof CarbonImmutable) {
                     $values['dateToFinish'] = $values['dateToFinish']->formatDateTimeForDb();
+                } elseif (
+                    is_string($values['dateToFinish'])
+                    && empty($values['timeToFinish'])
+                    && preg_match('/^\d{4}-\d{2}-\d{2}$/', $values['dateToFinish'])
+                ) {
+                    // Calendar-date input (e.g. "2026-05-21" from mobile) — store as
+                    // midnight without any timezone conversion.
+                    //
+                    // dateToFinish is semantically a calendar-date field: "due on
+                    // this day on the user's calendar", no time, no TZ. Running it
+                    // through parseUserDateTime (which interprets it as user-local
+                    // wall-clock end-of-day and converts to UTC for storage) caused
+                    // the visible "Hi Claude due May 21 stored as May 22" bug, because
+                    // the LA-default end-of-day rolls past UTC midnight. Per the
+                    // mobile audit (date-handling Tier 1), calendar-date fields
+                    // should round-trip as YYYY-MM-DD strings with no TZ math.
+                    //
+                    // This branch only activates when:
+                    //   - dateToFinish looks like "YYYY-MM-DD" with no time, AND
+                    //   - timeToFinish is absent
+                    // so existing web UI paths that submit dates with companion times
+                    // continue to use parseUserDateTime unchanged.
+                    $values['dateToFinish'] = $values['dateToFinish'].' 00:00:00';
+                    unset($values['timeToFinish']);
                 } else {
                     if (isset($values['timeToFinish']) && $values['timeToFinish'] != null) {
                         $values['dateToFinish'] = dtHelper()->parseUserDateTime(
@@ -3522,7 +6323,6 @@ class Tickets
                         $values['editFrom'] = dtHelper()->parseUserDateTime(
                             $values['editFrom'],
                             $values['timeFrom'],
-                            FromFormat::UserDateTime
                         )->formatDateTimeForDb();
                         unset($values['timeFrom']);
                     } else {
@@ -3578,6 +6378,7 @@ class Tickets
      *
      * @api
      */
+    #[RequiresPermission(TicketsPermissions::VIEW, projectIdParam: 'projectId')]
     public function findMilestone(string $term, int $projectId)
     {
 
@@ -3604,6 +6405,7 @@ class Tickets
      *
      * @api
      */
+    #[RequiresPermission(TicketsPermissions::VIEW, projectIdParam: 'projectId')]
     public function findTicket(string $term, int $projectId, ?int $userId)
     {
 
@@ -3629,6 +6431,7 @@ class Tickets
      *
      * @api
      */
+    #[RequiresPermission(TicketsPermissions::VIEW, projectIdParam: 'projectId')]
     public function pollForNewAccountMilestones(?int $projectId = null, ?int $userId = null): array|false
     {
         $todos = $this->ticketRepository->getAllBySearchCriteria(
@@ -3658,6 +6461,7 @@ class Tickets
      *
      * @api
      */
+    #[RequiresPermission(TicketsPermissions::VIEW, projectIdParam: 'projectId')]
     public function pollForUpdatedAccountMilestones(?int $projectId = null, ?int $userId = null): array|false
     {
         $milestones = $this->ticketRepository->getAllBySearchCriteria(
@@ -3691,6 +6495,7 @@ class Tickets
      *
      * @api
      */
+    #[RequiresPermission(TicketsPermissions::VIEW, projectIdParam: 'projectId')]
     public function pollForNewAccountTodos(?int $projectId = null, ?int $userId = null): array|false
     {
         $todos = $this->ticketRepository->getAllBySearchCriteria(
@@ -3718,6 +6523,7 @@ class Tickets
      *
      * @api
      */
+    #[RequiresPermission(TicketsPermissions::VIEW, projectIdParam: 'projectId')]
     public function pollForUpdatedAccountTodos(?int $projectId = null, ?int $userId = null): array|false
     {
         $todos = $this->ticketRepository->getAllBySearchCriteria(
